@@ -1,0 +1,1114 @@
+---
+title: "HW4"
+author: "Meng Cheng"
+date: "11/23/2019"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+##Import required package
+```{r}
+rm(list = ls(all = TRUE))
+library(igraph)
+library(Matrix)
+library(gdata)
+library(proxy)
+library(plm)
+library(ggplot2)
+library(data.table)
+library(dplyr)
+library(zoo)
+```
+
+##Import dataset and pre clean the data to include only US data
+```{r}
+#import dataset
+data1 <- fread("box_office_revenues.csv", header = TRUE)
+data2 <- fread("film_cast_members.csv", header = TRUE)
+data3 <- fread("film_keywords.csv", header = TRUE)
+data4 <- fread("producers_and_films.csv", header = TRUE)
+data5 <- fread("production_subsidiaries.csv", header = TRUE)
+
+#only consider US
+data4 <- data4[data4$country=="us"]
+#clean duplicate
+data4 <- unique(data4)
+```
+
+#Question 1
+
+1. First,we want to know if film makers that engage in collaborations with one another are more innovative or not. We can measure innovation through the number of new, never-before-seen keywords that are used in a film. We can also measure innovation through the number of new combinations of existing keywords that are used in a film. To account for the natural time cycle of the production process, consider a keyword or combination to be new if it has been introduced within the last three years. 
+We also want to know what kinds of collaborations contribute to innovation: are collaborations between large, generalist production companies more innovative? Or, are collaborations between large producers and more specialized, smaller producers more innovative? 
+For this first question, consider two different measures of identifying whether a firm is a generalist or not. Base one measure on the scale of a company's productions: consider a production company to be a generalist if it is in the top quartile of the number of films released by producers that year. In general, a producer will be classified as a generalist if it makes more than one film in a year. Base the second measure on a company's global coreness in the collaboration network: consider a production company to be a generalist if it is in the top quartile of coreness(eigenvector centrality) over its last ten observations. If a company has fewer than ten observations, treat the non-existent observations as zeros.
+
+(A) Classify each film by the type of collaboration that it represents. There should be five types for each measure of generalism: 
+i. Peripheral solo productions: films made by a single specialist 
+ii. Central solo productions: films made by a single generalist 
+iii. Central co-productions: films made by a group of multiple generalists 
+iv. Peripheral co-productions: films made by a group of multiple specialists 
+v. Hybrid co-productions: films made by a group of generalists and specialists
+For each measure of generalism, a figure that illustrates the number of new keywords and new combinations of existing keywords that are introduced per type of film over the course of the data. On the x-axis should be years, and on the y-axis should be the count of new keywords or new combinations.
+
+
+##Identify producer as generalist or specialist
+
+###Measure 1
+
+Base one measure on the scale of a company's productions: consider a production company to be a generalist if it is in the top quartile of the number of films released by producers that year. In general, a producer will be classified as a generalist if it makes more than one film in a year.
+```{r}
+#create prolist to get the count - how many films produced by a producer each year
+prodlist <- data4 %>%
+  group_by(pcindex,year) %>%
+  summarise(count = n())
+
+#producer with more than 1 film produced in a year as Generalist, the opposite as Specialist
+prodlist$type1 <- "S"
+prodlist$type1[which(prodlist$count>1)] <- "G"
+
+```
+
+###Measure 2
+
+Base the second measure on a company's global coreness in the collaboration network: consider a production company to be a generalist if it is in the top quartile of coreness(eigenvector centrality) over its last ten observations. If a company has fewer than ten observations, treat the non-existent observations as zeros.
+```{r}
+#get the list of unique film information and unique producer information for future reference
+uniquefilm <- data4[,1:2]
+uniquefilm <- unique(uniquefilm)
+uniqueprod <- unique(data4$pcindex)
+
+#get the count of how many producer engaged in the production for each film
+filmlist <- data4 %>%
+  group_by(pindex,year) %>%
+  summarise(count = n())
+
+#since the max of count in filmlist is 11, which means at maximum there are 11 producers produce a film together
+#so construct a matrix with nrow=13 would be enough to hold the corporation producer pcindex, the film pindex, year
+#ncol is the number of films we have according to uniquefilm
+cooplist <- matrix(nrow=13,ncol=14133)
+
+#add pcindex, pindex and year information by column (each observation takes a column)
+for (i in 1:dim(uniquefilm)[1]){
+  film <- uniquefilm[i]$pindex
+  year <- uniquefilm[i]$year
+  prod <- data4$pcindex[which(data4$pindex==film)]
+  cooplist[2:(length(prod)+1),i]<-prod
+  cooplist[13,i]<-film
+  cooplist[1,i]<-year
+}
+
+#get a corporation without film pindex in order to get possible_pairs in the next step
+cooplistc <- cooplist[1:12,]
+
+# take assignment 3 code as reference
+# possible_pairs = lapply(seq_len(nrow(investors)), function(i) t(cooplistc[i,]))
+# helpful to avoid vectoring on rows with apply functions when possible
+# get all pairs
+possible_pairs = lapply(seq_len(ncol(cooplistc)), function(i) cooplistc[,i])
+
+# get rid of blanks to make the object smaller
+for(i in seq_along(possible_pairs)){
+	possible_pairs[[i]] = possible_pairs[[i]][!is.na(possible_pairs[[i]])]
+}
+
+# ignore films where there is only one producer
+# can use logical index as in outlook email network setup
+index = sapply(seq_along(possible_pairs), function(i) length(possible_pairs[[i]]) > 2)
+possible_pairs = possible_pairs[index]
+
+#get whole edgelist
+edges = lapply(seq_along(possible_pairs), function(i) data.table(t(combn(possible_pairs[[i]][-1], 2)), year = possible_pairs[[i]][1] ))
+
+# calling data table on this just so we can refer to column names and make the rest of the code more interpetable
+# main issue is that it's not possible to call $ on matrix-type objects, even if they have explicit column names
+edges = rbindlist(edges)
+
+#change column name
+colnames(edges) = c("v1", "v2", "year")
+
+#get unique and ordered year list for future reference
+yearlist <- as.integer(sort(unique(edges$year)))
+
+#new data table to store all eigenvector centrality result
+wholeresult <- data.table()
+
+#for each year, calculate the eigenvector centralities for each company
+for(selyear in yearlist){
+  edge<- edges[edges$year<=selyear]
+  network <- graph.data.frame(edge[,1:2],directed = FALSE)
+  # get eigenvector centralities to measure global coreness
+  eigencen <- eigen_centrality(network, directed = FALSE, scale = TRUE, weights = NULL, options = arpack_defaults)
+  eigencent <- eigencen$vector
+  namecol <- names(eigencent)
+  eigencentcol <- unname(eigencent)
+  result <- cbind(namecol,eigencentcol,selyear)
+  colnames(result) = c("pcindex", "eigencen", "year")
+  wholeresult <- rbind(wholeresult,result)
+}
+
+#add eigenvector centralities variable
+prodlist <- merge(prodlist,wholeresult,by=c("pcindex","year"),all.x = TRUE)
+
+#replace NA as 0, here NA stands for no corporation ever before
+prodlist$eigencen[is.na(prodlist$eigencen)] <- 0
+
+#calculate if a producer is a generalist as if it is in the top quartile of coreness(eigenvector centrality) over its last ten observations. 
+
+#to have a look on how many producer have more than 10 observation and how many dont
+te <- prodlist %>%
+  group_by(pcindex) %>%
+  summarise(count = n())
+
+#Suggestion from prof:
+#For the prior average, this can be set up like the lags are set up in the solutions from Question 1A of Exercise 3, using the function rollapplyr() from the zoo package, grouping by production company on the sorted data table where each row represents a producer's coreness in a year that it makes a film. In this rollapplyr, the width would be (-10:1) instead of (-1).
+
+#code reference:
+#districts_adjrain[, (lags) := lapply(.SD, function(x) rollapplyr(x, list(-1), mean, partial = TRUE, fill = NA)), .SDcols = cols, by = district]	
+# can also do this in four lines, but cols/sdcols/lapply from the data table example saves a bit of space
+# it's also a bit more modular in case we want to add columns in later on
+
+#try
+#cols_chosen <- c("eigencen")
+#prodlist1[, lapply(.SD, function(x) rollapplyr(x,list(-10:1), mean, partial = TRUE, fill = NA)), .SDcols =cols_chosen, by = pcindex]
+
+#not work, use the below method
+
+#order the prolist by pcindex and year
+setorderv(prodlist, c("pcindex", "year"))
+
+#create new column to store rop quantile value for each film each year
+prodlist$eigencen10 <- NA
+
+#calculate the top quantile value
+for(i in 1:dim(prodlist)[1]){
+  prod<- prodlist[i,]$pcindex
+  selyear <- prodlist[i,]$year
+  obser <- prodlist[which(prodlist$pcindex==prod&prodlist$year<=selyear),]
+  obser10 <- top_n(obser, 10, year)
+  add <- 10-dim(obser10)[1]
+  cal <- rep(0,times=add)
+  cal <- as.numeric(c(cal,obser10$eigencen))
+  prodlist[i,6]<-quantile(cal,c(0.75))
+}
+
+#make the judgement
+prodlist$type2 <- "S"
+prodlist$type2[which(prodlist$eigencen10<prodlist$eigencen)] <- "G"
+
+
+```
+
+
+##Identify film type
+```{r}
+#prepare the data, add producer type information
+adjdata4 <- merge(data4, prodlist, by = c("pcindex","year"), all.x = TRUE, 
+      sort = TRUE, suffixes = c(".x",".y"), no.dups = TRUE)
+```
+
+###With Measure 1
+```{r}
+#make the judgement with measure 1 for film type
+filmlist$typeM1<-0
+for(i in 1:dim(filmlist)[1]){
+  filmname <- filmlist[i,]$pindex
+  prod <- adjdata4[adjdata4$pindex==filmname]
+  if(filmlist[i,]$count==1){
+    if(prod$type1 == "S"){
+      type <- 1
+      }
+    else{
+      type <- 2
+      }}
+  else if("S" %in% prod$type1){
+    if("G" %in% prod$type1){
+      type <- 5
+      }
+    else{
+      type <- 4
+    }
+    }
+  else{
+    type <- 3
+  }
+  filmlist[i,4]<-type
+}
+  
+```
+
+###With Measure 2
+```{r}
+#make the judgement with measure 2 for film type
+filmlist$typeM2<-0
+for(i in 1:dim(filmlist)[1]){
+  filmname <- filmlist[i,]$pindex
+  prod <- adjdata4[adjdata4$pindex==filmname]
+  if(filmlist[i,]$count==1){
+    if(prod$type2 == "S"){
+      type <- 1
+      }
+    else{
+      type <- 2
+      }}
+  else if("S" %in% prod$type2){
+    if("G" %in% prod$type2){
+      type <- 5
+      }
+    else{
+      type <- 4
+    }
+    }
+  else{
+    type <- 3
+  }
+  filmlist[i,5]<-type
+}
+  
+```
+
+
+##Indentify New
+
+###New Single Keywords
+```{r}
+#combine the keyword information on film with year(add year information)
+data3 <- merge(data3,filmlist,by="pindex",all.x = TRUE)
+data3 <- data3[,1:3]
+
+#clean missing data
+data3 <- na.omit(data3)
+ 
+```
+
+```{r}
+#find the first year that a keyword appears for each keyword
+keywordlist <- data3 %>%
+  group_by(keyword) %>%
+  summarise(first=min(year))
+
+#add the first appearence information
+data3 <- merge(data3,keywordlist,by="keyword",all.x = TRUE)
+
+#make the judgement if a keyword first shows up in last 3 year - a new keyword
+data3$new <- data3$year<=(data3$first+3)
+
+# original method which takes so long
+
+#for(i in 1:dim(data3)[1]){
+#  selkeyword <- data3[i]$keyword
+#  selyear <- data3[i]$year
+#  data3[i,4] <- as.logical(nrow(data3[which(data3$keyword==selkeyword&data3$year<(selyear-3)),])>0)
+#  }
+
+```
+
+
+```{r}
+#transer the logical variable to 0/1 variable
+data3$newkey <- 0
+data3$newkey[which(data3$new==TRUE)] <- 1
+
+#use groupby to count of new keyword by film
+newwordlist <- data3 %>%
+  group_by(pindex) %>%
+  summarise(newkeycount = sum(newkey))
+
+  
+```
+
+
+###New Keywords Combination
+```{r}
+#new dataset for only existing kewword, for future reference as we only consider existing keyword for new combination
+data3Exist <- data3[which(data3$newkey==0)]
+
+#see how many existing keyword each film has
+FilmWithMul <- data3Exist %>%
+  group_by(pindex) %>%
+  summarise(count = n())
+
+#see how many films have more than 2 existing keywords, which is available for combination
+FilmWithMul <- FilmWithMul[which(FilmWithMul$count>1),]
+```
+
+
+###get whole list of existing keyword combination
+
+As this takes long time to run, here I just show the code I use.
+
+When knit this rmd document, I import the saved result instead of rerunning this part of code.
+
+Code Used:
+```{r}
+#setorderv(FilmWithMul,c("pindex"))
+#setorderv(data3Exist,c("pindex"))
+
+#wholecombinelist <-data.table() 
+
+#for(film in FilmWithMul$pindex){
+#  newword <- data3Exist[which(data3Exist$pindex==film)]$keyword
+#  com <- t(combn(newword,2))
+#  combine <- cbind(film,com)
+#  wholecombinelist <- rbind(wholecombinelist,combine)
+#}
+
+#write.csv(wholecombinelist, file = "wholecombinelist.csv")
+```
+
+
+
+```{r}
+#read in saved result for above code and adjust format
+wholecombinelist <- fread("wholecombinelist.csv", header = TRUE)
+wholecombinelist <- wholecombinelist[,2:4]
+```
+
+
+```{r}
+#set a new copy for further change
+wholecombine <- wholecombinelist
+names(wholecombine) <- c("pindex","W1","W2")
+wholecombine$pindex <- as.integer(wholecombine$pindex)
+
+#add year information
+wholecombine <- merge(wholecombine,filmlist[,1:2],by="pindex",all.x=TRUE)
+
+#to remove duplicate combination within a year but may appear in different film
+#the combination data is by year but not by film now
+wholecombineByY <- wholecombine[,2:4]
+wholecombineByY <- unique(wholecombineByY)
+
+#get the first year a combination appears and the freqence a combination appears
+combineFq <- wholecombineByY %>%
+  group_by(W1,W2) %>%
+  summarise(count = n(),First=min(year))
+
+#add first appearence and freqence information to the film level combination data 
+wholecombine <- merge(wholecombine,combineFq,by=c("W1","W2"),all.x = TRUE)
+wholecombine$newcom <- (wholecombine$year-3 <= wholecombine$First)
+
+#groupby pindex to get the count of new combination for each film
+NewcombByfilm <- wholecombine %>%
+  group_by(pindex) %>%
+  summarise(newcom=sum(newcom))
+```
+
+##Clean and Format Final Result Data
+```{r}
+filmlistc <- merge(newwordlist,filmlist,by="pindex",all.y=TRUE)
+filmlistclean <- na.omit(filmlistc)
+filmlistclean <- merge(NewcombByfilm,filmlistclean,by="pindex",all.y=TRUE)
+filmlistclean[is.na(filmlistclean)] <- 0
+filmlistclean$typeM1 <-as.factor(filmlistclean$typeM1)
+filmlistclean$typeM2 <-as.factor(filmlistclean$typeM2)
+```
+
+#A.Plot
+```{r}
+Measure1Newkeyword <- ggplot(data = filmlistclean,aes(x = year, y = newkeycount)) + 
+  geom_smooth(method = "loess", se = F,mapping = aes(color = typeM1)) +
+  labs(x = "year", y = "New Keywords",title="New Keywords Count against Year (Measure1)")
+
+Measure1NewCom <- ggplot(data = filmlistclean,aes(x = year, y = newcom)) + 
+  geom_smooth(method = "loess", se = F,mapping = aes(color = typeM1)) +
+  labs(x = "year", y = "New Combination",title="New Combination Count against Year (Measure1)")
+
+Measure2Newkeyword <- ggplot(data = filmlistclean,aes(x = year, y = newkeycount)) + 
+  geom_smooth(method = "loess", se = F,mapping = aes(color = typeM2)) +
+  labs(x = "year", y = "New Keywords",title="New Keywords Count against Year (Measure2)")
+
+Measure2NewCom <- ggplot(data = filmlistclean,aes(x = year, y = newcom)) + 
+  geom_smooth(method = "loess", se = F,mapping = aes(color = typeM2)) +
+  labs(x = "year", y = "New Combination",title="New Combination Count against Year (Measure2)")
+
+Measure1Newkeyword
+Measure1NewCom
+Measure2Newkeyword
+Measure2NewCom
+
+
+```
+##INSIGHT
+
+1. With the development of the film industry, the appearence of innovation in new keywords is getting less while the appearence of innovation in existing keywords combination is getting more.
+
+2. For both measure of producer type, the films that solo produced by a single specialist have the lowest level of innovation (for both new keywords and new existing kewwords combination).
+
+3. For both measure of producer type, when considering the innovation as introdcing new keywords, films produced by a group of generalists and specialists are generally the most innovative.
+
+4. For both measure of producer type, when considering the innovation as introdcing new existing keyword combinations, films produced by a group of generalists and specialists or films produced by a group of multiple generalists are generally the most innovative. The trends along the year are more varied and difference between each film types are larger when we use the the second measure.
+
+5. For films produced by a single specialist/a single generalist/a group of multiple specialists, there is a obvirous peak of new existing keyword combinations around year 1993~1994 and a obvirous peak of new keywords around year 1994~1998.
+
+6. Overall, I think film makers that engage in collaborations with one another are more innovative while the type of collaborations is also important. To engage in collaborations with different type of film makes could benefit the innovation best in our case. In other words, films produced by a group of generalists and specialists results in most new keywords and new combinations.
+
+
+
+#B 
+For each measure of generalism, estimate one regression predicting the number of new keywords and another regression predicting the number of new combinations of existing keywords producers introduce in a year. Use as predictors the number of films a producer makes that year that fall into each of the three co-production types. So, there will be three collaboration predictors
+
+##Get Regression X variables
+```{r}
+data4clean <- adjdata4[,c(1:3,7,8,11)]
+data4clean <- merge(data4clean,filmlistclean[,c(1:3,6,7)],by="pindex",all.x = TRUE)
+data4clean <- na.omit(data4clean)
+data4clean <- unique(data4clean)
+
+#add box office information
+data4clean <- merge(data4clean,data1[,c(1,4)],by="pindex",all.x = TRUE)
+#exclude observations with box office data missing
+data4clean <- data4clean[!is.na(data4clean$total_box),]
+
+```
+
+
+For the Jaccard distance, use as the input an incidence/affiliation matrix where on one dimension, e.g., rows, are the production companies and on the other, e.g., columns are the keywords used in each production companies films. To make the computation more memory efficient, you can use sparseMatrix() from the Matrix package -- this applies to the incidence matrix mentioned above as well, and in general it makes sense to input the entries to these matrices as factors/numbers rather than characters. 
+
+##get coordinate data
+```{r}
+library(reshape2)
+prodword <- merge(data3[,1:3],data4[,c(1,4)],by="pindex",allow.cartesian=TRUE)
+prodwordc <- unique(prodword[,2:4])
+```
+
+
+###create incidence matrix for each year, calculate Jaccard distance with dist() and get the coordinate data with cmdscale() 
+
+As this takes long time to run, here I just show the code I use.
+
+When knit this rmd document, I import the saved result instead of rerunning this part of code.
+
+Code Used:
+```{r}
+#coorvar <- data.table()
+#for(selyear in yearlist){
+#  t1 <- prodwordc[which((prodwordc$year>=selyear-2)&(prodwordc$year<=selyear)),c(1,3)]
+#  result <- data.frame(dcast(t1, pcindex ~ keyword,fun.aggregate=length), row.names = 1)
+#  result[result>1] <- 1
+#  t2 <- as.data.table(cmdscale(dist(result)),keep.rownames = TRUE)
+#  t2$year <- selyear
+#  coorvar <- rbind(coorvar,t2)
+#}
+
+#names(coorvar)<-c("pcindex","C1","C2","year")
+#write.csv(coorvar, file = "coorvar.csv")
+```
+
+
+```{r}
+#import saved result from above code and format
+coorvar <- fread("coorvar.csv", header = TRUE)
+coorvar <- coorvar[,2:5]
+
+```
+
+##Get Regression Data
+```{r}
+regvar <- data4clean %>%
+  group_by(pcindex,year) %>%
+  summarise(M1T3 = sum(typeM1==3),M1T4 = sum(typeM1==4),M1T5 = sum(typeM1==5),
+            M2T3 = sum(typeM2==3),M2T4 = sum(typeM2==4),M2T5 = sum(typeM2==5),
+            total_box = sum(total_box))
+
+```
+
+#Add by producer by year variables
+```{r}
+#add Coordinate 1 + Coordinate 2
+regvar <- merge(regvar,coorvar,by=c("pcindex","year"),all.x = TRUE)
+
+#get operation begin year
+op <- data4clean %>%
+  group_by(pcindex) %>%
+  summarise(opyear = min(year))
+
+#add operation year information
+regvar <- merge(regvar,op,by="pcindex",all.x = TRUE)
+regvar$opyears <- regvar$year - regvar$opyear
+
+#get subsidary information
+prodlist <- merge(prodlist,data5,by="pcindex",all.x=TRUE)
+prodlist$sub <- 0
+
+#check if there is producer that are still subsidary with no last_year, result is none
+#t1<-prodlist[which(prodlist$first_year!=NA&prodlist$last_year==NA),]
+
+prodlist$sub[which(prodlist$first_year<=year&prodlist$last_year>=year)]<-1
+
+#add subsidary informtion
+regvar <- merge(regvar,prodlist[,c(1,2,10)],by=c("pcindex","year"),all.x = TRUE)
+
+#add offset - total films made that year, for which there is keyword information
+numoffilm <- unique(data3[,c(1,3)]) %>%
+  group_by(year) %>%
+  summarise(NumFilm = n())
+
+regvar <- merge(regvar,numoffilm,by=c("year"),all.x = TRUE)
+```
+
+#Y variable - producer level new keywords and new combination
+```{r}
+#new keyword
+compNkw <- merge(data3[which(data3$newkey==1),],adjdata4[,c(1,3)],by="pindex",all.y=TRUE,allow.cartesian=TRUE)
+compNkw <- unique(na.omit(compNkw)[,c(2,3,7)])
+
+numofcompNkw <- compNkw %>%
+  group_by(pcindex,year) %>%
+  summarise(compNKw = n())
+
+#new combination
+compNC <- merge(wholecombine[which(wholecombine$newcom==TRUE),c(1:4,7)],adjdata4[,c(1,3)],by="pindex",all.y=TRUE,allow.cartesian=TRUE)
+compNC <- unique(na.omit(compNC)[,c(2,3,4,6)])
+
+numofcompNC <- compNC %>%
+  group_by(pcindex,year) %>%
+  summarise(compNC = n())
+
+#add to regression data
+regvar <- merge(regvar,numofcompNkw,by=c("pcindex","year"),all.x = TRUE)
+regvar <- merge(regvar,numofcompNC,by=c("pcindex","year"),all.x = TRUE)
+
+#replace NA with 0 - producer without new keywords or combination within the year
+regvar$compNKw[is.na(regvar$compNKw)] <-0
+regvar$compNC[is.na(regvar$compNC)] <-0
+
+```
+
+#Regression
+```{r}
+#make a copy
+#write.csv(regvar, file = "regvar.csv")
+#import and format again
+regvar <- fread("regvar.csv", header = TRUE)
+regvar <- regvar[,c(2:18)]
+regvarc <- na.omit(regvar)
+names(regvarc)[17] <- "compNc"
+
+
+library(MASS)
+
+#regression
+regM1Newkw <- glm.nb(compNKw ~ M1T3 + M1T4 + M1T5 + C1 + C2 + total_box + opyears + sub + factor(year), data=regvarc, offset(NumFilm)) 
+
+regM2Newkw <- glm.nb(compNKw ~ M2T3 + M2T4 + M2T5 + C1 + C2 + total_box + opyears + sub + factor(year), data=regvarc, offset(NumFilm)) 
+
+#regM1NewC <- glm.nb(compNc ~ M1T3 + M1T4 + M1T5 + C1 + C2 + total_box + opyears + sub + factor(year), data=regvarc, offset(NumFilm)) 
+#regM2NewC <- glm.nb(compNc ~ M2T3 + M2T4 + M2T5 + C1 + C2 + total_box + opyears + sub + factor(year), data=regvarc, offset(NumFilm)) 
+#above 2 regressions get error 'step size truncated due to divergence.Error in glm.fitter(x = X, y = Y, w = w, etastart = eta, offset = offset,  : NA/NaN/Inf in 'x''
+
+#try using glm(formula, data, offset, family = "poisson") as suggestted by prof
+regM1NewC1 <- glm(compNc ~ M1T3 + M1T4 + M1T5 + C1 + C2 + total_box + opyears + sub + factor(year), data=regvarc, offset(NumFilm),family="poisson") 
+
+regM2NewC1 <- glm(compNc ~ M2T3 + M2T4 + M2T5 + C1 + C2 + total_box + opyears + sub + factor(year), data=regvarc, offset(NumFilm),family="poisson") 
+
+#show regression result
+summary(regM1Newkw)
+summary(regM2Newkw)
+summary(regM1NewC1)
+summary(regM2NewC1)
+
+```
+
+##INSIGHT
+
+What kinds of collaborations seem to result in the most new keywords and new combinations of existing keywords? 
+Comparing the two measures of generalism, are collaborations between large or small companies or core and peripheral companies more effective for creative innovation? 
+
+-From the regression result, both Central co-production and Hybrid co-productions have positive effect on the new keywords and new combinations while Peripheral co-productions has negative effect on both no matter what measure of generalism we use. And all coefficients are highly significant according to p-value.
+
+-Only when we use measure 1, Central co-productions show higher coefficience than Hybrid co-productions on new combinations. In other three regressions, Hybrid co-productions show the largest coefficience. And this correspond with what we observe in the plots. Hybrid co-productions seem to result in the most new keywords and new combinations.
+
+-In this way, the collaborations between core and peripheral companies more effective for creative innovation.
+
+
+#Question 2
+
+We can measure the extent to which a producer collaborates with similar producers as the average Jaccard distance between a producer and the other producers it works with based on the co-occurrence of keywords the producers use.
+
+###Get the average Jaccard distance with similar method in question 1b
+
+As this takes long time to run, here I just show the code I use.
+
+When knit this rmd document, I import the saved result instead of rerunning this part of code.
+
+Code Used:
+```{r}
+#avgDist <- data.table()
+#for(selyear in yearlist){
+#  t1 <- prodwordc[which((prodwordc$year>=selyear-2)&(prodwordc$year<=selyear)),c(1,3)]
+#  result <- data.frame(dcast(t1, pcindex ~ keyword,fun.aggregate=length), row.names = 1)
+#  result[result>1] <- 1
+#  t2 <- apply(as.matrix(dist(result)), 1,mean,na.rm=TRUE)
+#  t3 <- data.frame(names(t2),unname(t2))
+#  t3$year <- selyear
+#  avgDist <- rbind(avgDist,t3)
+#}
+
+#names(avgDist) <- c("pcindex","avgJD","year")
+#write.csv(avgDist, file = "avgDist.csv")
+```
+
+
+```{r}
+#import saved data from above code
+avgDist <- fread("avgDist.csv", header = TRUE)
+regvarc1 <- merge(regvarc,avgDist,by=c("year","pcindex"),all.x=TRUE)
+
+#plot
+ggplot(regvarc1, aes(avgJD, compNKw)) + 
+  geom_smooth(method = "loess", se = T) + 
+  labs(x = "Average Jaccard distance", y = "New keywords",title = "Q2")
+
+```
+
+##INSIGHT
+
+What does the pattern suggest about what kinds of collaborative partnerships might result in more creative innovation? Does this help to explain the results from Question 1?
+
+From above plot, larger average Jaccard distance results in more creative innovation. Larger average Jaccard distance means that a producer has less common keywords in its films overall. This suggests that collaborative partnerships 
+between varied producers could result in more creative innovation. 
+
+Respond to Question 1, it's reasonable that for specialists, they are more small/peripheral in the film industry which means they have less common with other companies and may have their own special focus area (as the larger Jaccard distance). The opposite is true as well. The collaborative partnerships between this two type of producers(hybrid type) leads to more creative innovation. 
+
+
+#Question 3
+
+Define each producer's yearly return as its yearly box office revenue divided by the total release coverage it invested in for that year for its films. 
+```{r}
+#get yearly return
+data1<-merge(data1,adjdata4[,1:3],by=c("pindex"),all.x = TRUE)
+data1c<-na.omit(data1[,c(1,2,4:6)])
+Q3 <- data1c %>%
+  group_by(pcindex,year) %>%
+  summarise(total_box=sum(total_box),total_relcov=sum(release_coverage))
+Q3$return <- Q3$total_box/Q3$total_relcov
+
+#remove inf
+Q3c <- Q3[!is.infinite(Q3$return),]
+```
+
+normalize each producer's box office return compared to the returns that all producers earned that year. To do this, subtract the mean return of all producers for that year from a producer's individual return and divide it by the standard deviation of the returns for all producers that year
+```{r}
+#since it's yearly
+#get yearly std and mean
+Q3yearly <- Q3c %>%
+  group_by(year) %>%
+  summarise(std=sd(return),mean=mean(return))
+
+#get normalization
+Q3c <- merge(Q3c,Q3yearly,by="year",all.x=TRUE)
+Q3c$NReturn <- (Q3c$return-Q3c$mean)/Q3c$std
+
+#add normalized returen to regression data
+regvarc2 <- merge(regvarc1,Q3c[,c(1,2,8)],by=c("year","pcindex"),all.x=TRUE)
+regvarc2 <- regvarc2[!is.na(regvarc2$NReturn),]
+
+#regression
+#could run correctly in rmd but when knit get error with help function
+#paste the output result below
+#Q31 <- lm(NReturn ??? M1T3 + M1T4 + M1T5 + C1 + C2 + total_box + opyears + sub + factor(year),data=regvarc2)
+
+#Q32 <- lm(NReturn ??? M2T3 + M2T4 + M2T5 + C1 + C2 + total_box + opyears + sub + factor(year),data=regvarc2)
+
+#summary(Q31)
+#summary(Q32)
+```
+##output
+Call:
+lm(formula = NReturn ~ M1T3 + M1T4 + M1T5 + C1 + C2 + total_box + opyears + sub + factor(year), data = regvarc2)
+
+Residuals:
+    Min      1Q  Median      3Q     Max 
+-4.4686 -0.4146 -0.1282  0.2236 19.6277 
+
+Coefficients: (1 not defined because of singularities)
+                   Estimate Std. Error t value Pr(>|t|)    
+(Intercept)       3.162e-01  1.034e-01   3.059  0.00223 ** 
+M1T3             -2.931e-01  1.591e-02 -18.425  < 2e-16 ***
+M1T4             -4.021e-01  2.814e-02 -14.288  < 2e-16 ***
+M1T5             -3.467e-01  1.429e-02 -24.266  < 2e-16 ***
+C1                3.822e-03  2.224e-03   1.718  0.08576 .  
+C2                4.669e-03  4.170e-03   1.120  0.26293    
+total_box         5.898e-09  1.280e-10  46.074  < 2e-16 ***
+opyears           4.435e-03  1.871e-03   2.371  0.01776 *  
+sub                      NA         NA      NA       NA    
+factor(year)1986 -1.007e-01  1.361e-01  -0.740  0.45962    
+factor(year)1987 -1.732e-01  1.427e-01  -1.214  0.22497    
+factor(year)1988 -8.431e-02  1.326e-01  -0.636  0.52500    
+factor(year)1989 -2.201e-01  1.337e-01  -1.646  0.09981 .  
+factor(year)1990 -2.755e-01  1.363e-01  -2.021  0.04328 *  
+factor(year)1991 -3.928e-01  1.386e-01  -2.833  0.00462 ** 
+factor(year)1992 -1.140e-01  1.351e-01  -0.844  0.39875    
+factor(year)1993 -1.785e-01  1.368e-01  -1.304  0.19215    
+factor(year)1994 -1.835e-01  1.294e-01  -1.418  0.15609    
+factor(year)1995 -1.963e-01  1.262e-01  -1.556  0.11986    
+factor(year)1996 -1.174e-01  1.239e-01  -0.948  0.34306    
+factor(year)1997 -3.862e-01  1.239e-01  -3.117  0.00184 ** 
+factor(year)1998 -2.072e-01  1.243e-01  -1.667  0.09557 .  
+factor(year)1999 -2.666e-01  1.210e-01  -2.204  0.02757 *  
+factor(year)2000 -3.048e-01  1.225e-01  -2.488  0.01288 *  
+factor(year)2001 -2.089e-01  1.195e-01  -1.748  0.08048 .  
+factor(year)2002 -2.137e-01  1.182e-01  -1.807  0.07073 .  
+factor(year)2003 -2.609e-01  1.169e-01  -2.233  0.02561 *  
+factor(year)2004 -1.470e-01  1.136e-01  -1.294  0.19573    
+factor(year)2005 -1.200e-01  1.116e-01  -1.075  0.28224    
+factor(year)2006 -7.324e-02  1.107e-01  -0.661  0.50836    
+factor(year)2007 -1.482e-01  1.102e-01  -1.345  0.17861    
+factor(year)2008 -1.863e-01  1.120e-01  -1.664  0.09612 .  
+factor(year)2009 -1.765e-01  1.106e-01  -1.596  0.11060    
+factor(year)2010 -1.926e-01  1.116e-01  -1.725  0.08457 .  
+factor(year)2011 -1.229e-01  1.110e-01  -1.107  0.26821    
+factor(year)2012 -1.265e-01  1.111e-01  -1.138  0.25517    
+factor(year)2013 -1.967e-01  1.106e-01  -1.778  0.07545 .  
+factor(year)2014 -1.105e-01  1.121e-01  -0.986  0.32434    
+factor(year)2015 -1.311e-01  1.139e-01  -1.150  0.25003    
+factor(year)2016 -2.657e-01  1.153e-01  -2.305  0.02121 *  
+
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+Residual standard error: 0.8727 on 7980 degrees of freedom
+Multiple R-squared:  0.2395,	Adjusted R-squared:  0.2359 
+F-statistic: 66.15 on 38 and 7980 DF,  p-value: < 2.2e-16
+
+
+Call:
+lm(formula = NReturn ~ M2T3 + M2T4 + M2T5 + C1 + C2 + total_box + opyears + sub + factor(year), data = regvarc2)
+
+Residuals:
+    Min      1Q  Median      3Q     Max 
+-4.5193 -0.4141 -0.1332  0.2282 19.6298 
+
+Coefficients: (1 not defined because of singularities)
+                   Estimate Std. Error t value Pr(>|t|)    
+(Intercept)       3.210e-01  1.037e-01   3.096 0.001970 ** 
+M2T3             -3.234e-01  1.168e-02 -27.676  < 2e-16 ***
+M2T4             -3.666e-01  4.245e-02  -8.635  < 2e-16 ***
+M2T5             -3.302e-01  1.518e-02 -21.747  < 2e-16 ***
+C1                3.808e-03  2.231e-03   1.706 0.087967 .  
+C2                4.843e-03  4.179e-03   1.159 0.246477    
+total_box         5.928e-09  1.279e-10  46.339  < 2e-16 ***
+opyears           4.923e-03  1.872e-03   2.630 0.008559 ** 
+sub                      NA         NA      NA       NA    
+factor(year)1986 -1.097e-01  1.366e-01  -0.803 0.421804    
+factor(year)1987 -1.614e-01  1.432e-01  -1.127 0.259681    
+factor(year)1988 -8.646e-02  1.331e-01  -0.650 0.515936    
+factor(year)1989 -2.308e-01  1.340e-01  -1.722 0.085040 .  
+factor(year)1990 -2.780e-01  1.367e-01  -2.034 0.042005 *  
+factor(year)1991 -3.961e-01  1.395e-01  -2.840 0.004524 ** 
+factor(year)1992 -1.306e-01  1.354e-01  -0.964 0.334899    
+factor(year)1993 -1.882e-01  1.371e-01  -1.373 0.169709    
+factor(year)1994 -2.083e-01  1.296e-01  -1.607 0.108093    
+factor(year)1995 -2.223e-01  1.262e-01  -1.761 0.078263 .  
+factor(year)1996 -1.394e-01  1.240e-01  -1.125 0.260772    
+factor(year)1997 -4.085e-01  1.239e-01  -3.298 0.000979 ***
+factor(year)1998 -2.298e-01  1.243e-01  -1.849 0.064459 .  
+factor(year)1999 -3.003e-01  1.207e-01  -2.488 0.012853 *  
+factor(year)2000 -3.331e-01  1.224e-01  -2.722 0.006503 ** 
+factor(year)2001 -2.381e-01  1.194e-01  -1.995 0.046073 *  
+factor(year)2002 -2.522e-01  1.178e-01  -2.141 0.032290 *  
+factor(year)2003 -3.021e-01  1.164e-01  -2.597 0.009432 ** 
+factor(year)2004 -1.870e-01  1.131e-01  -1.654 0.098236 .  
+factor(year)2005 -1.581e-01  1.111e-01  -1.423 0.154888    
+factor(year)2006 -1.048e-01  1.107e-01  -0.947 0.343727    
+factor(year)2007 -1.895e-01  1.100e-01  -1.723 0.084936 .  
+factor(year)2008 -2.118e-01  1.123e-01  -1.887 0.059232 .  
+factor(year)2009 -2.230e-01  1.100e-01  -2.027 0.042672 *  
+factor(year)2010 -2.287e-01  1.113e-01  -2.054 0.039969 *  
+factor(year)2011 -1.591e-01  1.106e-01  -1.438 0.150467    
+factor(year)2012 -1.632e-01  1.107e-01  -1.473 0.140718    
+factor(year)2013 -2.313e-01  1.104e-01  -2.094 0.036277 *  
+factor(year)2014 -1.425e-01  1.121e-01  -1.271 0.203603    
+factor(year)2015 -1.665e-01  1.138e-01  -1.463 0.143466    
+factor(year)2016 -2.946e-01  1.153e-01  -2.556 0.010603 *  
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+Residual standard error: 0.8733 on 7980 degrees of freedom
+Multiple R-squared:  0.2385,	Adjusted R-squared:  0.2348 
+F-statistic: 65.76 on 38 and 7980 DF,  p-value: < 2.2e-16
+
+
+
+##INSIGHT
+
+What do the results suggest about financial outcomes for collaborations?
+
+-For all three types of collaborations with both type of measures, the coefficients are negative and highly significant. It suggests that for film industry, collaborations have negative influence on a production company's financial returns compared to solo production. 
+
+-Among three types of collaborations, no matter what measure of generalist we based on, number of peripheral co-productions has the biggest negative influence and number of central co-productions has the relatively lightest negative influence. 
+
+-It suggests that collaborations' negative effect on financial outcomes is more significant within specialists and less significant within generalists. This may due to generalists are more experienced in collaboratins and have more resources.
+
+
+#Question 4
+
+Collaborations can be financially risky because of the coordination required to integrate multiple producers' experiences into a making new film. Do producers gain anything from these collaborations creatively or financially in the long term? 
+
+(A) Estimate a regression predicting the count of new keywords introduced in a producer's solo produced films in a year. 
+```{r}
+#get y variable
+Q4 <- merge(filmlistclean[,c(1,3,6,7)],adjdata4[,c(1:3)],by="pindex",all.y=TRUE)
+Q4 <- na.omit(Q4)
+
+#for measure 1
+Q4M1 <- Q4[which(Q4$typeM1==1|Q4$typeM1==2),] %>%
+  group_by(pcindex,year) %>%
+  summarise(csoloNKM1 = sum(newkeycount))
+
+#for measure 2
+Q4M2 <- Q4[which(Q4$typeM2==1|Q4$typeM2==2),] %>%
+  group_by(pcindex,year) %>%
+  summarise(csoloNKM2 = sum(newkeycount))
+
+```
+
+Use as a predictor the cumulative number of new keywords a producer has introduced in all of its films through the current year that were made in "hybrid" collaborations. 
+```{r}
+#for measure 1
+cumNKM1 <- Q4[which(Q4$typeM1==5),] %>%
+  group_by(pcindex,year) %>%
+  summarise(newkeycount = sum(newkeycount))
+
+#cumulative value
+cumNKM1 <- cumNKM1 %>%
+  group_by(pcindex) %>%
+  arrange(year) %>%
+  mutate(cumNKM1 = cumsum(newkeycount))
+
+#for measure 2
+cumNKM2 <- Q4[which(Q4$typeM2==5),] %>%
+  group_by(pcindex,year) %>%
+  summarise(newkeycount = sum(newkeycount))
+
+#cumulative value
+cumNKM2 <- cumNKM2 %>%
+  group_by(pcindex) %>%
+  arrange(year) %>%
+  mutate(cumNKM2 = cumsum(newkeycount))
+```
+
+###combine regression data
+```{r}
+#add cumulative new keywords count
+regvarc3 <- merge(regvarc2,cumNKM1[,c(1,2,4)],by=c("year","pcindex"),all.x=TRUE)
+regvarc3 <- merge(regvarc3,cumNKM2[,c(1,2,4)],by=c("year","pcindex"),all.x=TRUE)
+regvarc3$cumNKM1[is.na(regvarc3$cumNKM1)] <- 0
+regvarc3$cumNKM2[is.na(regvarc3$cumNKM2)] <- 0
+
+#add y variable - count of new keywords introduced in a producer's solo produced films
+regvarc3 <- merge(regvarc3,Q4M1,by=c("year","pcindex"),all.x=TRUE)
+regvarc3 <- merge(regvarc3,Q4M2,by=c("year","pcindex"),all.x=TRUE)
+regvarc3$csoloNKM1[is.na(regvarc3$csoloNKM1)] <- 0
+regvarc3$csoloNKM2[is.na(regvarc3$csoloNKM2)] <- 0
+
+```
+
+###Use the same set of controls as in Questions 1 and 2. The outcome is a count, so use glm.nb().
+```{r}
+#run regression
+Q41 <- glm.nb(csoloNKM1 ~ cumNKM1 + C1 + C2 + total_box + opyears + sub + factor(year), data=regvarc3) 
+Q42 <- glm.nb(csoloNKM2 ~ cumNKM2 + C1 + C2 + total_box + opyears + sub + factor(year), data=regvarc3) 
+
+summary(Q41)
+summary(Q42)
+
+```
+
+##INSIGHT
+
+Does creative innovation gained through collaborations make a producer's solo-produced films more innovative? What does this suggest? 
+
+-Form above regression results, cumulative count of new keywords introdced in hybrid collaborations with both measures have positive but not significant effect on solo-produced films' innovation.
+
+-It suggests that producer indeed get creative innovation gained through collaborations onto solo=produced films' innovation but the effect is slightly and could not be relied on.
+
+
+(B) Accounting for a producer's engaging in collaborations, does introducing new keywords result in higher box office returns? 
+
+To gain insight into this, estimate the same regression model from Question 2, but add in a predictor for the number of new keywords introduced. 
+```{r}
+#regression with one more predictor for the cumulative count of new keywords introduced
+#could run correctly in rmd but when knit get error with help function
+#paste the output result below
+#Q4B1 <- lm(NReturn ???  cumNKM1 + M1T3 + M1T4 + M1T5 + C1 + C2 + total_box + opyears + sub + factor(year),data=regvarc3)
+#Q4B2 <- lm(NReturn ???  cumNKM2 + M2T3 + M2T4 + M2T5 + C1 + C2 + total_box + opyears + sub + factor(year),data=regvarc3)
+
+#summary(Q4B1)
+#summary(Q4B2)
+
+```
+##result
+
+Call:
+lm(formula = NReturn ~ cumNKM1 + M1T3 + M1T4 + M1T5 + C1 + C2 + total_box + opyears + sub + factor(year), data = regvarc3)
+
+Residuals:
+    Min      1Q  Median      3Q     Max 
+-4.1789 -0.4147 -0.1334  0.2213 19.6332 
+
+Coefficients: (1 not defined because of singularities)
+                   Estimate Std. Error t value Pr(>|t|)    
+(Intercept)       2.801e-01  1.028e-01   2.726 0.006430 ** 
+cumNKM1          -9.111e-04  8.957e-05 -10.172  < 2e-16 ***
+M1T3             -2.844e-01  1.583e-02 -17.972  < 2e-16 ***
+M1T4             -3.417e-01  2.858e-02 -11.957  < 2e-16 ***
+M1T5             -2.874e-01  1.534e-02 -18.736  < 2e-16 ***
+C1                5.249e-03  2.214e-03   2.370 0.017791 *  
+C2                3.695e-03  4.145e-03   0.891 0.372731    
+total_box         6.219e-09  1.310e-10  47.455  < 2e-16 ***
+opyears           1.283e-02  2.033e-03   6.308 2.98e-10 ***
+sub                      NA         NA      NA       NA    
+factor(year)1986 -8.511e-02  1.352e-01  -0.629 0.529161    
+factor(year)1987 -1.291e-01  1.419e-01  -0.910 0.362737    
+factor(year)1988 -5.643e-02  1.318e-01  -0.428 0.668602    
+factor(year)1989 -1.977e-01  1.329e-01  -1.487 0.136938    
+factor(year)1990 -2.545e-01  1.354e-01  -1.880 0.060196 .  
+factor(year)1991 -3.863e-01  1.378e-01  -2.804 0.005064 ** 
+factor(year)1992 -1.172e-01  1.343e-01  -0.873 0.382956    
+factor(year)1993 -1.751e-01  1.360e-01  -1.288 0.197920    
+factor(year)1994 -2.040e-01  1.286e-01  -1.587 0.112594    
+factor(year)1995 -2.307e-01  1.254e-01  -1.839 0.065976 .  
+factor(year)1996 -1.608e-01  1.231e-01  -1.306 0.191529    
+factor(year)1997 -4.241e-01  1.232e-01  -3.443 0.000579 ***
+factor(year)1998 -2.448e-01  1.236e-01  -1.981 0.047592 *  
+factor(year)1999 -3.062e-01  1.203e-01  -2.546 0.010917 *  
+factor(year)2000 -3.436e-01  1.218e-01  -2.821 0.004798 ** 
+factor(year)2001 -2.523e-01  1.188e-01  -2.123 0.033780 *  
+factor(year)2002 -2.630e-01  1.176e-01  -2.237 0.025311 *  
+factor(year)2003 -3.023e-01  1.162e-01  -2.601 0.009300 ** 
+factor(year)2004 -1.809e-01  1.130e-01  -1.601 0.109384    
+factor(year)2005 -1.540e-01  1.109e-01  -1.388 0.165098    
+factor(year)2006 -1.093e-01  1.101e-01  -0.993 0.320925    
+factor(year)2007 -1.899e-01  1.096e-01  -1.734 0.083045 .  
+factor(year)2008 -2.212e-01  1.113e-01  -1.987 0.046942 *  
+factor(year)2009 -2.214e-01  1.100e-01  -2.014 0.044084 *  
+factor(year)2010 -2.364e-01  1.110e-01  -2.130 0.033201 *  
+factor(year)2011 -1.617e-01  1.103e-01  -1.466 0.142801    
+factor(year)2012 -1.676e-01  1.105e-01  -1.517 0.129310    
+factor(year)2013 -2.402e-01  1.100e-01  -2.183 0.029066 *  
+factor(year)2014 -1.562e-01  1.115e-01  -1.402 0.161092    
+factor(year)2015 -1.744e-01  1.133e-01  -1.540 0.123709    
+factor(year)2016 -3.171e-01  1.147e-01  -2.765 0.005704 ** 
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+Residual standard error: 0.8672 on 7979 degrees of freedom
+Multiple R-squared:  0.2493,	Adjusted R-squared:  0.2456 
+F-statistic: 67.94 on 39 and 7979 DF,  p-value: < 2.2e-16
+
+
+Call:
+lm(formula = NReturn ~ cumNKM2 + M2T3 + M2T4 + M2T5 + C1 + C2 + total_box + opyears + sub + factor(year), data = regvarc3)
+
+
+Residuals:
+    Min      1Q  Median      3Q     Max 
+-4.1904 -0.4143 -0.1349  0.2222 19.6526 
+
+Coefficients: (1 not defined because of singularities)
+                   Estimate Std. Error t value Pr(>|t|)    
+(Intercept)       3.141e-01  1.033e-01   3.039 0.002379 ** 
+cumNKM2          -1.469e-03  1.941e-04  -7.565 4.30e-14 ***
+M2T3             -3.246e-01  1.164e-02 -27.873  < 2e-16 ***
+M2T4             -3.234e-01  4.269e-02  -7.577 3.95e-14 ***
+M2T5             -2.764e-01  1.672e-02 -16.529  < 2e-16 ***
+C1                4.117e-03  2.224e-03   1.851 0.064149 .  
+C2                4.442e-03  4.164e-03   1.067 0.286140    
+total_box         6.094e-09  1.294e-10  47.111  < 2e-16 ***
+opyears           8.169e-03  1.914e-03   4.268 2.00e-05 ***
+sub                      NA         NA      NA       NA    
+factor(year)1986 -1.226e-01  1.361e-01  -0.901 0.367770    
+factor(year)1987 -1.836e-01  1.427e-01  -1.286 0.198524    
+factor(year)1988 -9.467e-02  1.326e-01  -0.714 0.475380    
+factor(year)1989 -2.360e-01  1.336e-01  -1.767 0.077264 .  
+factor(year)1990 -2.871e-01  1.362e-01  -2.108 0.035100 *  
+factor(year)1991 -4.290e-01  1.391e-01  -3.085 0.002042 ** 
+factor(year)1992 -1.414e-01  1.349e-01  -1.048 0.294507    
+factor(year)1993 -1.904e-01  1.366e-01  -1.394 0.163334    
+factor(year)1994 -2.225e-01  1.292e-01  -1.723 0.084972 .  
+factor(year)1995 -2.448e-01  1.258e-01  -1.946 0.051709 .  
+factor(year)1996 -1.658e-01  1.236e-01  -1.342 0.179625    
+factor(year)1997 -4.281e-01  1.235e-01  -3.467 0.000529 ***
+factor(year)1998 -2.571e-01  1.239e-01  -2.075 0.038002 *  
+factor(year)1999 -3.232e-01  1.203e-01  -2.687 0.007220 ** 
+factor(year)2000 -3.605e-01  1.220e-01  -2.954 0.003142 ** 
+factor(year)2001 -2.590e-01  1.190e-01  -2.177 0.029500 *  
+factor(year)2002 -2.692e-01  1.174e-01  -2.293 0.021866 *  
+factor(year)2003 -3.111e-01  1.160e-01  -2.683 0.007313 ** 
+factor(year)2004 -2.001e-01  1.127e-01  -1.775 0.075908 .  
+factor(year)2005 -1.675e-01  1.107e-01  -1.512 0.130500    
+factor(year)2006 -1.266e-01  1.104e-01  -1.147 0.251554    
+factor(year)2007 -2.098e-01  1.096e-01  -1.913 0.055723 .  
+factor(year)2008 -2.323e-01  1.119e-01  -2.076 0.037928 *  
+factor(year)2009 -2.363e-01  1.096e-01  -2.156 0.031126 *  
+factor(year)2010 -2.477e-01  1.110e-01  -2.232 0.025644 *  
+factor(year)2011 -1.679e-01  1.103e-01  -1.523 0.127896    
+factor(year)2012 -1.835e-01  1.104e-01  -1.662 0.096524 .  
+factor(year)2013 -2.543e-01  1.101e-01  -2.310 0.020938 *  
+factor(year)2014 -1.656e-01  1.117e-01  -1.482 0.138317    
+factor(year)2015 -1.861e-01  1.134e-01  -1.641 0.100887    
+factor(year)2016 -3.197e-01  1.149e-01  -2.782 0.005407 ** 
+---
+Signif. codes:  0 '***' 0.001 '**' 0.01 '*' 0.05 '.' 0.1 ' ' 1
+
+Residual standard error: 0.8703 on 7979 degrees of freedom
+Multiple R-squared:  0.2439,	Adjusted R-squared:  0.2402 
+F-statistic: 65.99 on 39 and 7979 DF,  p-value: < 2.2e-16
+
+
+##INSIGHT
+
+Does this result help explain why producers might engage in collaborations, eventhough they can be financially risky?
+
+-From above regression results, the cumulative count of new keywords introduced with both measures has negative and significant effect on the financial return. It suggests that the direction of getting innovative and gainning higher financial return is opposite. And both coefficients are really small (-9.111e-04 and -1.469e-03).
+
+-It does help explain why producers might engage in collaboration as they can be financially risky. They have this trade-off and have the choice to sacrifice a relatively small amount on financial return for more creative innovation.
+
+
+#Extra Credit
+
+We also have information about the people that work on films as cast members. These include actors, writers, directors, and other kinds of creative talent. The file "film_cast_members.csv" contains a unique key identifying the creative talent and describes what role they worked on as a member of the cast of each film.
+One way that production companies might benefit from collaborating with one another is that it helps them hire more innovative creative talent to work on their films. 
+
+###Define a cast member's innovativeness as the cumulative number of new keywords created in the films that they have worked on in their career up to the prior year.
+```{r}
+#with merge function, inner join the film-new keyword information and data2(film_cast_member.csv).
+ex1 <- merge(filmlistclean,data2,by=c("pindex","year"))
+ex1 <- ex1[,c(1,2,4,9:12)]
+
+#groupby cast member and year and get the sum of new keywords 
+ex2 <- ex1 %>%
+  group_by(nconst,year) %>%
+  summarise(newkeycount = sum(newkeycount))
+
+#cumulative value
+ex2 <- ex2 %>%
+  group_by(nconst) %>%
+  arrange(year) %>%
+  mutate(cumNK = cumsum(newkeycount))
+
+```
+
+##Assumed Approach
+
+###Using the scale-based classification to define generalists and specialists
+
+1.merge the ex2(data table contain cast member innovativeness information) with film-producer data table to get the sum of innovativeness by pcindex by year
+
+2.get the top 75% point value by year
+
+3.make judgement if a producer is a generalist or specialist
+
+4.categorize film based on this new measure of generalist
+
+###Estimate a regression predicting the innovativeness of the hired creative talent based on the types of collaborations a production company engages in. 
+
+1.regression is like:
+
+reg <- glm.nb(sum of innovativeness by producer by year ~ M3T3 + M3T4 + M3T5 + C1 + C2 + total_box + opyears + sub + factor(year), data=regvarc, offset(NumFilm)) 
+
+###Does engaging in more hybrid collaborations seem to help with hiring more innovative creative talent?
+
+I assume that from above regression, the coefficients of M3T3, M3T4, M3T5(number of three types of collaborations respectively) should be positive and significant. Among the three types of collaboration, M3T5(number of hybrid collaborations) should have the largest coefficient. It suggests that engaging in more hybrid collaborations seem to help with hiring more innocative creative talent.
+
