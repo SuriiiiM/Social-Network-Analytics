@@ -1,0 +1,689 @@
+---
+title: "Assignment6"
+author: "Meng Cheng"
+date: "12/16/2019"
+output: html_notebook
+---
+
+Import required package
+```{r, message=FALSE, warning=FALSE}
+library(igraph)
+library(Matrix)
+library(gdata)
+library(proxy)
+library(plm)
+library(ggplot2)
+library(data.table)
+library(dplyr)
+library(zoo)
+library(stringr)
+library(RSiena)
+library(sna)
+
+```
+
+
+Import dataset
+```{r, message=FALSE, warning=FALSE}
+#import dataset
+data1 <- fread("execs.csv", header = TRUE)
+data2 <- fread("individual_investors.csv", header = TRUE)
+data3 <- fread("deal_details.csv", header = TRUE)
+data4 <- fread("investor_details.csv", header = TRUE)
+data5 <- fread("company_details.csv", header = TRUE)
+data6 <- fread("people.csv", header = TRUE)
+
+
+```
+
+clean the data and construct edge list
+```{r, message=FALSE, warning=FALSE}
+#focus the set of entrepreneurs just on those whose Full Title is indicated to be “Founder”, “Chief Executive Officer”, or “Managing Director”
+data1 <- data1[grepl("Chief Executive Officer", Full.Title) | grepl("Founder", Full.Title) | grepl("Managing Director", Full.Title)]
+
+
+#only consider deals that have occurred from 2000s onward
+#remove missing date information
+data3 <- data3[which(data3$Deal_Date!=""),]
+
+#transform date into year
+data3$Year <- as.integer(str_sub(data3$Deal_Date,-2))
+
+changeY <- function(x){
+  if(x<=18){
+    x = x+2000
+  }
+  else{
+    x = x+1900
+  }
+  return(x)
+}
+
+data3$Year <- sapply(data3$Year,changeY)
+data3 <- data3[which(data3$Year>=2000),]
+
+#Consider investments to be all deals in the Deal Class “Venture Capital”.
+data3 <- data3[which(data3$Deal_Class=="Venture Capital"),]
+
+
+#set up the investor to exec edges
+data1[, exec_no := seq_len(.N), by = CompanyId]
+
+#To account for multiple execs that may have the founder/CEO role, can split up this file into a list to provide a unique RHS key for merging to the investors
+execs_split <- split(data1, f = data1$exec_no)
+
+#Then set the key
+for(i in seq_along(execs_split)){
+  setkey(execs_split[[i]], CompanyId)
+}
+
+setkey(data2, CompanyId)
+
+#And merge together with the investors
+edges <- list()
+for(i in seq_along(execs_split)){
+edges[[i]] <- merge(data2, execs_split[[i]])
+print(paste0("executive no. ", i))
+flush.console()
+}
+
+
+#This will be the edges object with ties and dates of ties
+edges <- rbindlist(edges)
+
+#And you can set the names
+colnames(edges)[colnames(edges) == "PersonId.x"] = "investor"
+colnames(edges)[colnames(edges) == "PersonId.y"] = "exec"
+edges[, Last.Updated := NULL]
+
+setorderv(edges, c("investor", "exec", "DealId", "CompanyId", "exec_no", "InvestorId", "Role"))
+
+#Bringing in deal info helps to make sure that we only consider ties while individual is working at company
+setkey(data3, DealId)
+setkey(edges, DealId)
+
+edges <- merge(edges, data3[,-2])
+
+#And subset to the dates that correspond to when the deals occur
+edges[, joined_date := as.Date(Date.Joined.Company, "%m/%d/%Y")]
+edges[, left_date := as.Date(Date.Left.Company, "%m/%d/%Y")]
+edges[, date := as.Date(Deal_Date, "%d %b %y")]
+
+
+edges[!is.na(joined_date) & !is.na(date), exclude_date_joined := joined_date > date]
+edges[!is.na(left_date) & !is.na(date), exclude_date_left := left_date < date]
+
+edges[is.na(joined_date), exclude_date_joined := FALSE]
+edges[is.na(left_date), exclude_date_left := FALSE]
+
+setorderv(edges, c("exec", "date"))
+
+#And then for getting the founder and company information can bring in companies
+colnames(data5)[1] <- "CompanyId" 
+setkey(data5, CompanyId)
+setkey(edges, CompanyId)
+
+edges <- merge(edges, data5[, c("CompanyId", "Primary_Industry_Sector", "Primary_Industry_Group", "Primary_Industry_Code", "Business_Status", "City", "State")])
+
+
+#make sure we only limit to venture capital deals
+unique(edges$Deal_Class)
+
+setorderv(edges, c("investor", "exec", "date"))
+
+#And then last for the people information 
+people <- data6[,c("PersonId", "Gender", "Education")]
+colnames(people)[colnames(people) == "PersonId"] = "investor"
+setkey(people, investor)
+setkey(edges, investor)
+
+edges <- merge(edges, people)
+
+colnames(people)[colnames(people) == "investor"] = "exec"
+setkey(people, exec)
+setkey(edges, exec)
+
+colnames(edges)[colnames(edges) == "Last Updated"] = "Last_Update_1"
+colnames(edges)[colnames(edges) == "Last_Updated"] = "Last_Update_2"
+edges[, Last_Updated_1 := NULL]
+edges[, Last_Updated_2 := NULL]
+
+edges = merge(edges, people)
+
+
+#And then from here can allow the network to be bipartite by removing cases where a person appears as both an investor and entrepeneur
+edges = edges[!exec %in% investor]
+edges = edges[!investor %in% exec]
+
+```
+
+choose primary industry groups
+for faster computering, only use deal occurs between 2010-2017
+```{r}
+
+unique(edges$Primary_Industry_Group)
+t1 <- edges%>%
+  group_by(Primary_Industry_Group)%>%
+  summarise(count=n())
+
+#Healthcare Technology Systems
+G1 <- edges[Year > 2009 & Year <= 2017 & Primary_Industry_Group == "Healthcare Technology Systems"] 
+
+#Transportation
+G2 <- edges[which(edges$Primary_Industry_Group=="Transportation"),]
+#Apparel and Accessories
+G3 <- edges[which(edges$Primary_Industry_Group=="Apparel and Accessories"),]
+#Insurance
+G4 <- edges[which(edges$Primary_Industry_Group=="Insurance"),]
+#Restaurants, Hotels and Leisure
+G5 <- edges[which(edges$Primary_Industry_Group=="Restaurants, Hotels and Leisure"),]
+
+
+```
+
+
+construct wave
+```{r}
+#to get the edge lists into the right format for SIENA, set up a yearly network object in igraph with a command by taking the most recent network as the baseline object and then removing ties from this network if they occurred after each year
+ 
+G1_current_igraph = graph_from_data_frame(G1[, c("investor", "exec")], directed = TRUE)
+V(G1_current_igraph)$type = V(G1_current_igraph)$name %in% G1$exec
+
+G1_edges_igraph = data.table(ends(G1_current_igraph, seq_len(ecount(G1_current_igraph))))
+
+colnames(G1_edges_igraph) = c("investor", "exec")
+setkeyv(G1_edges_igraph, c("investor", "exec"))
+ 
+G1_edges_igraph[, edge_position := .I]
+ 
+ 
+G1[, earliest_year := min(Year, na.rm = TRUE), by = c("investor", "exec")]
+G1[, latest_year := max(Year, na.rm = TRUE), by = c("investor", "exec")]
+ 
+earliest_years = unique(G1[,c("investor", "exec", "earliest_year", "latest_year")])
+setkeyv(earliest_years, c("investor", "exec"))
+ 
+edges_earliest_year = merge(G1_edges_igraph, earliest_years, all.x = TRUE)
+
+```
+
+```{r}
+#sets up yearly network by deleting edges that occur after year i, and also those that are not renewed across years -- will generalize to those that are over 5 years old
+ 
+years = seq(min(as.numeric(G1$Year), na.rm = TRUE), max(as.numeric(G1$Year), na.rm = TRUE))
+invested_year = lapply(seq_along(years), function(i) igraph::delete.edges(G1_current_igraph, edges_earliest_year$edge_position[edges_earliest_year$earliest_year > years[i] | years[i] - edges_earliest_year$latest_year > 5]))
+ 
+#For each of the elements in invested_year, use get.incidence() from igraph to get the matrix for each year.
+?get.incidence
+investments = list(
+  get.incidence(invested_year[[1]], sparse = FALSE),
+  get.incidence(invested_year[[2]], sparse = FALSE),
+  get.incidence(invested_year[[3]], sparse = FALSE),
+  get.incidence(invested_year[[4]], sparse = FALSE),
+  get.incidence(invested_year[[5]], sparse = FALSE),
+  get.incidence(invested_year[[6]], sparse = FALSE),
+  get.incidence(invested_year[[7]], sparse = FALSE),
+  get.incidence(invested_year[[8]], sparse = FALSE)
+)
+ 
+#Then, the SIENA data can be set up as an array using the matrix for each year. 
+#first change all >1 value to 1 as it is unweighted
+for(i in 1:length(years)){
+  t1<-investments[[i]]
+  t1[t1 >1] <- 1
+  investments[[i]]<-t1
+}
+
+G1_investments = sienaDependent(array(c(
+  investments[[1]],
+  investments[[2]],
+  investments[[3]],
+  investments[[4]],
+  investments[[5]],
+  investments[[6]],
+  investments[[7]],
+  investments[[8]]
+), c(dim(investments[[1]]), length(years))),
+  "bipartite", nodeSet = c("senders", "receivers")
+)
+ 
+#And make sure to set up the node sets using the nodeset functions 
+ 
+senders <- sienaNodeSet(length(unique(G1$investor)), nodeSetName = "senders")
+receivers <- sienaNodeSet(length(unique(G1$exec)), nodeSetName = "receivers")
+
+
+```
+
+
+include gyadic predictors based on individual attributes
+```{r}
+# These objects must be designated as constant, time-invariant dyadic covariates to the nodeSets “senders” and “receivers” using coDyadCovar(). 
+
+#Ethnic homophily
+ethnic <- unique(fread("representative_names.csv", header = TRUE)[,c("Name","race")])
+t1 <- merge(unique(G1[,"investor"]),data6[,c("PersonId","Last Name")],by.x="investor",by.y="PersonId")
+t1$`Last Name` <- toupper(t1$`Last Name`) 
+t1 <- merge(t1,ethnic,by.x="Last Name",by.y="Name",all.x = TRUE)
+t1[which(t1$race=="white"),"race"]<-NA
+
+t2 <- merge(unique(G1[,"exec"]),data6[,c("PersonId","Last Name")],by.x="exec",by.y="PersonId")
+t2$`Last Name` <- toupper(t2$`Last Name`) 
+t2 <- merge(t2,ethnic,by.x="Last Name",by.y="Name",all.x = TRUE)
+t2[which(t2$race=="white"),"race"]<-NA
+
+t3<-t2
+#convert to vector
+t1 <- setNames(t1$race,t1$investor)
+t2 <- setNames(t2$race,t2$exec)
+
+t1 <- as.vector(t1)
+t2 <- as.vector(t2)
+
+#cov
+tt <- outer(t1,t2,"==")
+tt[is.na(tt)] <- 0
+
+#construct the output matrix
+Xethnic <- coDyadCovar(tt,nodeSets=c("senders","receivers"),type="bipartite")
+
+#make sure the column and row are consistent
+#dim(Xethnic)
+#dim(investments[[1]])
+
+#here also get Entrepreneur ethnic minority,a constant alter covariate indicating that the entrepreneur has a race that is not White.
+
+t3$racenew <- !is.na(t3$race)
+
+#construct the output matrix
+#error with coDyadCovar, use coCovar instead
+#nonwhite_exec <- coDyadCovar(t1,nodeSets=c("receivers"))
+t3 <- as.vector(as.numeric(t3$racenew))
+nonwhite_exec <- coCovar(t3,nodeSet="receivers")
+
+
+#gender homophily
+t1 <- unique(G1[,c("investor","Gender.x")])
+t2 <- unique(G1[,c("exec","Gender.y")])
+
+#convert to named vector
+t1 <- as.vector(setNames(t1$Gender.x,t1$investor))
+t2 <- as.vector(setNames(t2$Gender.y,t2$exec))
+
+#cov
+tt <- outer(t1,t2,"==")
+tt[is.na(tt)] <- 0
+
+#construct the output matrix
+Xgender <- coDyadCovar(tt,nodeSets=c("senders","receivers"),type="bipartite")
+
+dim(Xgender)
+
+#here also can get Entrepreneur gender, a constant alter covariate indicating an entrepreneurs’ gender. This can be computed as a binary vector.
+
+t2[t2=="Male"]<-0
+t2[t2=="Female"]<-1
+t2 <- as.numeric(t2)
+
+gender_exec <- coCovar(t2,nodeSet="receivers")
+
+
+#top school homophily
+#see what school we have
+g1 <- G1[,"Education.x"]
+colnames(g1) <- "school"
+g2 <- G1[,"Education.y"]
+colnames(g2) <- "school"
+t3 <- rbind(g1,g2)%>%
+  group_by(school)%>%
+  summarise(count=n())
+
+t1 <- unique(G1[,c("investor","Education.x")])
+t2 <- unique(G1[,c("exec","Education.y")])
+
+#list of top school
+topedu <- c("Brown University","Columbia University","Cornell University","Dartmouth College","Harvard","Princeton University","University of Pennsylvania","Yale University","MIT","Stanford","Northwestern University","Massachusetts Institute of Technology","Berkeley","Columbia Business School","University of Chicago","Carnegie Mellon University","Oxford","Cambridge")
+
+#if have top school education
+t1$topedu <- grepl(paste(topedu,collapse="|"), t1$Education.x)
+t2$topedu <- grepl(paste(topedu,collapse="|"), t2$Education.y)
+
+#convert to named vector
+t1 <- as.vector(setNames(t1$topedu,t1$investor))
+t2 <- as.vector(setNames(t2$topedu,t2$exec))
+
+t1[t1==FALSE]<-NA
+t2[t2==FALSE]<-NA
+
+#cov
+tt <- outer(t1,t2,"==")
+tt[is.na(tt)] <- 0
+
+#construct the output matrix
+Xedu <- coDyadCovar(tt,nodeSets=c("senders","receivers"),type="bipartite")
+
+dim(Xedu)
+
+#here can also get Entrepreneur top school a constant alter covariate indicating whether an entrepreneur earned a degree from a top educational institution, as described in the previous section. This can be computed as a binary vector.
+
+t2[t2==NA]<-0
+
+ivyplus_exec <- coCovar(t2,nodeSet="receivers")
+
+#geographic homophily
+load("C:/Users/mengc/Desktop/Fall/Social Network Analytics/HW6/edges_dist.RData")
+t1 <- unique(G1[,c("investor","InvestorId")])
+t2 <- unique(G1[,c("exec","CompanyId")])
+
+#merge with location information
+t1 <- merge(t1,unique(edges_dist[,c(1,6,5)]),by="InvestorId",all.x=TRUE)
+t2 <- merge(t2,unique(edges_dist[,c(2,4,3)]),by="CompanyId",all.x=TRUE)
+
+library(geosphere)
+
+#only keep first observation for each individual
+t1[, no := seq_len(.N), by = investor]
+t1 <- t1[which(no==1),]
+
+t2[, no := seq_len(.N), by = exec]
+t2 <- t2[which(no==1),]
+
+#set input
+t1 <- data.frame(unique(t1[,c(2:4)]), row.names = 1)
+t2 <- data.frame(unique(t2[,c(2:4)]), row.names = 1)
+
+tt <- distm(as.matrix(t1),as.matrix(t2),fun=distGeo)
+dim(tt)
+rownames(tt) <- rownames(t1)
+colnames(tt) <- rownames(t2)
+
+tt[tt=="NaN"] <- NA
+
+#construct the output matrix
+Xgeo <- coDyadCovar(tt,nodeSets=c("senders","receivers"),type="bipartite")
+
+
+
+#Experience homophily
+#This covariate can be computed as an outer product of the difference between the first year of investment or venture founding for each individual
+t1 <- unique(G1[,c("investor","Year")])
+t2 <- unique(G1[,c("exec","Year")])
+
+t1 <- t1%>%
+  group_by(investor)%>%
+  summarise(first=min(Year))
+
+t2 <- t2%>%
+  group_by(exec)%>%
+  summarise(first=min(Year))
+
+#convert to named vector
+t1 <- as.vector(setNames(t1$first,t1$investor))
+t2 <- as.vector(setNames(t2$first,t2$exec))
+
+#here we also get Entrepreneur experience,a constant alter covariate indicating the year an entrepreneur’s ﬁrst venture received funding. This can be computed as a numeric vector. 
+first_year_exec <- coCovar(t2,nodeSet="receivers")
+
+#back
+#difference
+tt <- outer(t1,t2,"-")
+tt <- abs(tt)
+
+#and each individual difference can be subtracted from the maximum difference to turn this into a similarity. 
+max <- max(tt)
+tt <- 7-tt
+rownames(tt) <- rownames(t1)
+colnames(tt) <- rownames(t2)
+
+#construct the output matrix
+Xexp <- coDyadCovar(tt,nodeSets=c("senders","receivers"),type="bipartite")
+
+
+
+#Complementary homophily
+t1 <- unique(G1[,c("investor","Education.x")])
+t2 <- unique(G1[,c("exec","Education.y")])
+
+#if have related education
+t1$tech <- grepl("engineering|ph.D", t1$Education.x)
+t1$bus <- grepl("MBA", t1$Education.x)
+t2$tech <- grepl("engineering|ph.D", t2$Education.y)
+t2$bus <- grepl("MBA", t2$Education.y)
+
+#combination1 investor-tech exec-bus
+#convert to named vector
+t11 <- as.vector(setNames(t1$tech,t1$investor))
+t21 <- as.vector(setNames(t2$bus,t2$exec))
+
+#here also can get Entrepreneur business skills,a constant alter covariate indicating whether an entrepreneur received an MBA. 
+t<-t2
+tbus <- as.vector(as.numeric(t$bus))
+mba_exec <- coCovar(tbus,nodeSet="receivers")
+
+
+#cov
+tt1 <- outer(t11,t21,"&")
+
+#combination2 investor-bus exec-tech
+#convert to named vector
+t12 <- as.vector(setNames(t1$bus,t1$investor))
+t22 <- as.vector(setNames(t2$tech,t2$exec))
+
+#here also can get Entrepreneur technical skills,a constant alter covariate indicating whether an entrepreneur received a technical degree like a PhD or an engineering degree.
+ttech <- as.vector(as.numeric(t$tech))
+technical_exec <- coCovar(ttech,nodeSet="receivers")
+
+#cov
+tt2 <- outer(t12,t22,"&")
+
+#two possible combination together
+tt <- tt1+tt2
+rownames(tt) <- rownames(t1)
+colnames(tt) <- rownames(t2)
+#construct the output matrix
+Xskills <- coDyadCovar(tt,nodeSets=c("senders","receivers"),type="bipartite")
+
+
+
+```
+
+individual predictors
+```{r}
+#These objects must be designated as constant, time-invariant alter covariates to the nodeSets “receivers” using coDyadCovar(). These covariates should be input in the form of a vector where the entries match the ordering of the entrepreneurs in the adjacencymatrix. Thesecovariateswillhavean“altX”for interaction1 in includeEffects(). 
+
+#nonwhite_exec already get in above chunk
+
+
+#gender_exec already get in above chunk
+
+
+#ivyplus_exec already get in above chunk
+
+
+#Entrepreneur geographic hub,a constant alter covariate indicating that the entrepreneur’s startup is located in one of the 10 cities that are most common for startups that are invested in to be located in. If individuals have multiple locations, you can use the first location ascribed to them in the data.
+t2 <- unique(G1[,c("exec")])
+
+#merge with location information
+city <- unique(data6[,c("PersonId","City")])
+t2 <- merge(t2,city,by.x="exec",by.y="PersonId",all.x=TRUE)
+
+#top10 city
+city <- G1 %>%
+  group_by(City)%>%
+  summarise(count=n())%>%
+  arrange(desc(count))
+topcity <- city$City[1:10]
+
+t2$topcity <- t2$City%in%topcity
+#convert to named vector
+t2 <- as.vector(as.numeric(t2$topcity))
+t2[t2==FALSE]<-0
+
+tech_hub_exec <- coCovar(t2,nodeSet="receivers")
+
+#first_year_exec already get in above chunk
+
+#mba_exec already get in above chunk
+
+#technical_exec already get in above chunk 
+
+#Entrepreneur venture round,a constant alter covariate indicating what round of funding a venture is on, as the cumulative count of unique funding deals it has received from investors. 
+t1 <- G1[,c("exec","DealId")] %>%
+  group_by(exec)%>%
+  summarise(count=n())
+
+#convert to named vector
+t1 <- as.vector(as.numeric(t1$count))
+
+round_exec <- coCovar(t1,nodeSet="receivers")
+
+```
+
+The SIENA model will want also want to take account of when people join and leave the network. 
+```{r}
+#?sienaCompositionChange()
+#The function sienaCompositionChange() takes a list where each element is a vector of length two that takes in the first position the period it enters the data and in the second position the last period in the data. 
+t1 <- G1[,c("investor","Year")] %>%
+  group_by(investor)%>%
+  summarise(ear=min(Year),lat=max(Year))
+
+t2 <- G1[,c("exec","Year")] %>%
+  group_by(exec)%>%
+  summarise(ear=min(Year),lat=max(Year))
+
+#convert to list
+t11 <- t(as.matrix(t1[,c(2,3)]))
+t21 <- t(as.matrix(t2[,c(2,3)]))
+
+period_investor <- sienaCompositionChange(as.data.frame(t11),nodeSet="senders")
+period_exec <- sienaCompositionChange(as.data.frame(t21),nodeSet="receivers")
+```
+
+
+Siean model
+```{r}
+#Define the data set 
+siena_data = sienaDataCreate(G1_investments,Xethnic,Xexp,Xgender,Xgeo,Xskills,Xedu,nonwhite_exec,gender_exec,ivyplus_exec,tech_hub_exec,first_year_exec,mba_exec,technical_exec,round_exec,nodeSets = list (senders,receivers))
+
+
+#obtain the basic effects object
+siena_effects = getEffects(siena_data)
+
+# now let's set up some effects
+
+# first the structural effects that are not yet included by default
+siena_effects = includeEffects(siena_effects, cycle4)
+siena_effects = includeEffects(siena_effects, outActSqrt)
+siena_effects = includeEffects(siena_effects, inPopSqrt)
+siena_effects = includeEffects(siena_effects, outInAss)
+
+```
+
+
+add dyadic predictors
+```{r}
+siena_effects = includeEffects(siena_effects, X, interaction1 = "Xethnic")
+siena_effects = includeEffects(siena_effects, X, interaction1 = "Xgender")
+siena_effects = includeEffects(siena_effects, X, interaction1 = "Xedu")
+siena_effects = includeEffects(siena_effects, X, interaction1 = "Xgeo")
+siena_effects = includeEffects(siena_effects, X, interaction1 = "Xexp")
+siena_effects = includeEffects(siena_effects, X, interaction1 = "Xskills")
+
+```
+
+add personal characteristics of exec
+```{r}
+#add personal characteristics of exec
+
+siena_effects <- includeEffects(siena_effects, altX, interaction1 = "nonwhite_exec")
+siena_effects = includeEffects(siena_effects, altX, interaction1 = "gender_exec")
+siena_effects = includeEffects(siena_effects, altX, interaction1 = "ivyplus_exec")
+siena_effects = includeEffects(siena_effects, altX, interaction1 = "tech_hub_exec")
+siena_effects = includeEffects(siena_effects, altX, interaction1 = "first_year_exec")
+siena_effects = includeEffects(siena_effects, altX, interaction1 = "mba_exec")
+siena_effects = includeEffects(siena_effects, altX, interaction1 = "technical_exec")
+siena_effects = includeEffects(siena_effects, altX, interaction1 = "round_exec")
+
+
+```
+```{r}
+#take a look at the effect
+siena_effects
+```
+
+```{r}
+#set up the model with Healthcare Technology Systems
+siena_algorithm =  sienaAlgorithmCreate(useStdInits = FALSE, projname = "investment_decisions_bipartite_Healthcare_Technology_Systems", diagonalize = 0.2) 
+# default diag with MoM is 1, with maxlike 0, default mode is MoM -- .2 has been recommended by siena authors
+```
+
+
+```{r}
+#run the model to get the results
+
+Sys.time()
+siena_result = siena07(siena_algorithm, data = siena_data, effects = siena_effects, nbrNodes = 3, useCluster = TRUE, initC = TRUE)
+
+Sys.time()
+```
+
+above model take too long to run, have no time for full result as output here and no time for other 4 industries.
+actually, for other 4 industries, only need to replace G1 with G2, G3, G4, G5 and rerun code after choosing industry to get the result.
+below is code for result output, rerun model and some significance tests.
+
+```{r}
+#save initial result to read in later
+save(siena_result, file = "siena_result_bipartite_Healthcare_Technology_Systems_iteration1.RData")
+```
+
+
+```{r}
+#To get subsequent runs for convergence t-ratios to be below abs(.1), set up a while loop to avoid having to re-check after each run
+
+#The ratios are stored in siena_result$tconv, so the following works
+
+i = 1
+
+while(sum(abs(siena_result$tconv) > .1) > 0 | c(siena_result$tconv.max >= .25)){ # check if any ratio is greater than abs(.1)
+
+  # rerun model using previous result as starting values
+siena_result = siena07(siena_algorithm, data = siena_data, effects = siena_effects, nbrNodes = 3, useCluster = TRUE, initC = TRUE, prevAns=siena_result)
+  i = i + 1
+  save(siena_result, file = paste0("siena_result_bipartite_7_25_it_services_iteration",i,".RData"))
+
+  # diagnostics for each run
+  print(paste("iteration number",i,"finished at",Sys.time(),sep = " "))
+  flush.console()
+
+}
+```
+
+
+```{r}
+#And a table with the output from the model object could look like the following, with some significance tests
+rbindlist(lapply(seq_along(siena_result$effects$effectName), function(i) data.table(
+  variable = siena_result$effects$effectName[i],
+  estimate = siena_result$theta[i],
+  std_err = siena_result$se[i],
+  tstat = siena_result$theta[i] /sqrt(siena_result $covtheta[i,i]),
+  pvalue_t = (1 - pnorm(abs(siena_result$theta[i] /sqrt(siena_result $covtheta[i,i])), 0, 1)) * 2,
+  t(unlist(Multipar.RSiena(siena_result, i))), # note that the t-tests and 1-parameter restriction Wald tests are the same
+  tconv = siena_result$tconv[i])))
+```
+
+### INSIGHT:
+
+For the result, should get Estimate/Standard Error/Convergence t-ratio for each included interactions and effects
+
+Could tell from the positive/negative value of estimate that the positive/negative effect of each interactions/effects(such as graduating from top school...) on the occurance of investments in a specific industry
+
+### extra credit
+
+for the a) and b) regression, just run similar regression as below(from the last question of HW2):
+summary(glm(out_of_business ~ eigcent +  corporate_venture_firm + monetary_size_deals_year_usdmn + early_stage_investor + year + factor(venture_firm_industry) + factor(venture_firm_location) + factor(tenure), data = outcomes, family = "binomial"))
+
+here, use the out_of_business (for question a)/successful_investments(for question b) as y variable and 
+l4c_scaled,Xethnic,Xexp,Xgender,Xgeo,Xskills,Xedu,nonwhite_exec,gender_exec,ivyplus_exec as x variables
+
+could tell investing based on a homophily help investors avoid going out of business if the estimate is negative for question a.
+could tell investing based on a homophily help investors achieve more successful investments if the estimate is positive for question b.
