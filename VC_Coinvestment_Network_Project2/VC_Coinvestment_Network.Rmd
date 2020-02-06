@@ -1,0 +1,540 @@
+---
+title: "Assignment2"
+author: "Meng Cheng"
+date: "10/28/2019"
+output:
+  html_document: default
+---
+Load Library and Read File
+```{r}
+rm(list = ls(all = TRUE))
+library(igraph)
+library(data.table)
+library(network)
+library(plotly)
+library(splitstackshape)
+library(stringr)
+library(tidyverse)
+library(readxl)
+setwd("C:/Users/mengc/Desktop/Fall/Social Network Analytics/HW2")
+
+data1 = fread("Funding_events_7.14.csv", header = TRUE)
+data2 = read_xlsx("Funding_events_7.14_page2.xlsx")
+
+#Standardizing Dates inorder to combine two dataset
+data1$`Deal Date`<-as.Date(data1$`Deal Date`,'%m/%d/%y')
+data2$`Deal Date`<-as.Date(data2$`Deal Date`,'%y-%m-%d')
+data = rbind(data1,data2)
+
+#data$`Deal Date`<-as.Date(data$`Deal Date`,'%m/%d/%y')
+
+```
+
+Data Cleaning
+```{r}
+#drop empty data and N.A
+netdata <- data[data$Investors!=''&!is.na(data$Investors)]
+
+#adjust suffix such as .LLC etc.
+#str_replace_all(string, pattern, replacement)
+netdata$Investors <- str_replace_all(netdata$Investors, c(", Inc" = ",Inc",", Inc."=",Inc.",", LDC"=",LDC",", LLC" = ",LLC.",", LLC." = ",LLC", ", llc" = ",llc",", L.L.C" = ",L.L.C",", LTD" = ",LTD",", Ltd" = ",Ltd",", Ltd."=",Ltd.",", Ltd" = ",Ltd", ", Co" = ",Co",", Corp"=",Corp",", LP"=",LP",", L.P"=",L.P", ", Limited." = ",Limited."))
+
+#drop row with only 1 investor since those rows dont create connnection for network
+netdata$logic <- str_detect(netdata$Investors, ', ', negate = FALSE)
+netdata <- netdata[netdata$logic==TRUE]
+```
+
+Split
+
+```{r}
+#split Investors column and get group of investors that connected to each other
+#str_split(string, pattern, n = Inf, simplify = FALSE)
+list <- str_split(netdata$Investors, ', ', n = Inf, simplify = FALSE)
+
+
+#create combination of each pair of investors within each group
+#combn(x, m, FUN = NULL, simplify = TRUE, …)
+combs <- lapply(list, combn, m=2) 
+
+#add deal date information
+listdate <- netdata$`Deal Date`
+datanum <-  matrix(unlist(lapply(combs,dim)),ncol=2,byrow=TRUE)[,2]
+netdate <- rep(listdate,datanum) # date
+
+#generate overall edgelist
+netedgelist <- matrix(unlist(combs), ncol = 2, byrow = TRUE) ## overall edgelist
+netedgelist <- apply(netedgelist,2,str_trim,side='both')
+netwhole <- cbind(netedgelist,netdate)
+#215214 rows
+
+#generate edgelist with no duplicate
+cleanedgelist <- unique(netedgelist)
+#113218 rows
+
+```
+
+
+Question1
+```{r}
+#generate graph with no duplicate
+distinct_network= graph_from_edgelist(cleanedgelist[,1:2], directed = FALSE)
+```
+
+(A)Which ﬁrm is the center of the venture capital ﬁrm network as of July 2014? Consider the most central ﬁrm to be the ﬁrm with the largest closeness centrality, as in the Hollywood Actor example.
+```{r}
+#find max closeness
+#closeness(graph, vids = V(graph), mode = c("out", "in", "all", "total"), weights = NULL, normalized = FALSE)
+which(closeness(distinct_network,vids = V(distinct_network))==max(closeness(distinct_network,vids = V(distinct_network))))
+node <- list(V(distinct_network))
+max(closeness(distinct_network,vids = V(distinct_network)))
+#closeness = 1.488921e-07
+
+```
+Intel Capital is the most central ﬁrm with the largest closeness centrality equal to 1.488921e-07
+
+
+(B) Next, compute the average shortest path length between all ﬁrms in the July 2014 network and verify that the ﬁrm with the highest closeness centrality also has the lowest average path distance. You can consider nodes that are unreachable to be separated by a number of steps equal to the total number of the ﬁrms in the network. 
+```{r}
+#get distance table
+dis <- distances(distinct_network,v = V(distinct_network))
+
+#replace unreachable to be separated by a number of steps equal to total number of firms in network
+dim(dis)
+dis[dis==Inf] = dim(dis)[1]
+
+#average shortest path
+mean(dis)
+
+#test if equal
+mean(dis['Intel Capital',])==min(apply(dis,1,mean))
+```
+The average shortest path length between all firms in the July 2014 network is 1020.193. 
+And the ﬁrm with the highest closeness centrality also has the lowest average path distance.(Intel Capital)
+
+
+(C) What is the average shortest path length for all ﬁrms? Why is this number so high? 
+```{r}
+mean(dis)
+sum(distances(distinct_network) == Inf)/2
+```
+The average shortest path length for all ﬁrms is 1020.193. This number is high because 
+1)there are 12890 firms in this network 
+2)many firms are not reachable from one another (there are 6554614 pairs of firms can not reach each other), and this make the shortest path calculation expand a lot 
+3)if we do not exclude isolate firms(which were dropped during data cleaning), this result would be even larger
+
+
+
+Question2
+Next, we will look at the development of the local group membership of the co-investment network over time. Allow the network to be updated monthly for each month t in the data, adding the new ties that occur through investments in the current month to be added to the existing network of ties that have occurred in previous months. In Class Session 3, a ﬁgure on Slide 59 plotted over time the industry average of the highestdegree k-core each venture capital ﬁrm in the co-investment network belonged to. When a node is a member of a k-core with a high degree, its surrounding ties are very dense. When many nodes are members of k-cores with high degrees, this suggests that there may exist dense clusters within the network. 
+
+(A) ConstructaﬁguresimilartoClassSession3’s, plotting the average k-core of eachventure capital ﬁrm in the network over time. This can be computed using the igraph function coreness. On the x-axis should be time. On the y-axis should be the highest-degree k-core each venture capital ﬁrm belongs to, averaged over all ﬁrms in the network up to that month. 
+```{r}
+#generate table contain edgelist with date
+netwhole1 <- as.data.table(netedgelist)
+netwhole1 <- cbind(netwhole1,netdate)
+netwhole1 <- netwhole1[order(netwhole1$netdate),]
+netwhole2 <- netwhole1
+
+#make the date as year-month(monthly according to instruction)
+library("zoo")
+netwhole2$yearmon <- as.yearmon(as.character(netwhole2$netdate))
+
+#get month list which has deal occur
+monthlist <- unique(netwhole2$yearmon)
+monthlist <- sort(monthlist)
+
+#get number of deal date and how many months overall between
+xaxis <- length(unique(netwhole2$yearmon))
+len <- (monthlist[1]-monthlist[253])*12
+
+#plot with whole edgelist monthly
+
+#create blank dataframe to hold updated dataframe for graph and average coreness result
+
+df <- data.frame()
+result <- data.frame()
+for(i in 0:397){
+  mon <- monthlist[1]+i*(1/12)
+  df <- netwhole2[(netwhole2$yearmon<=mon)][,1:2]
+  network <- graph.data.frame(df,directed=FALSE)
+  core <- mean(coreness(network))
+  newrow <- data.frame(mon,core)
+  result <- rbind(result,newrow)
+}
+
+plot(result,type="l")
+
+```
+
+
+(B) Construct a plot similar to (A), but only consider unique ties as opposed to repeated ties in the calculation. Does the ﬁgure appear different than before? What does this suggest about the nature of relationships in the co-investment network? 
+```{r}
+#plot with unique edgelist monthly
+df1 <- data.frame()
+result1 <- data.frame()
+
+for(i in 0:397){
+  mon <- monthlist[1]+i*(1/12)
+  df1 <- netwhole2[(netwhole2$yearmon<=mon)][,1:2]
+  df1 <- unique(df1)
+  network <- graph.data.frame(df1,directed=FALSE)
+  core <- mean(coreness(network))
+  newrow <- data.frame(mon,core)
+  result1 <- rbind(result1,newrow)
+}
+
+plot(result1,type="l")
+```
+Figure B is different from figure A 
+1)increase of average coreness in B after 2000 is relatively gradual compared to A 
+2)figure B shows decrease or even tend to stabilize after 2008
+3)the max average coreness achieved in A is larger than 15 while it's smaller than 10 in B
+
+It suggests that in this co-investment network, there are many duplicate connection generated from the investors column:
+1)investors tend to make deal together with those that they have previously make deal together with, it may indicates they hold long corporation relationship and build trust along time. Also, it may be their same investment style and preference that connection them together and thus, make them always interested in similar companies
+2)within this co-investment network,with the rapid financial and technological growth after the dot-com bubble around 2000, many new investors and firms emerged. Thus, the boom of investment increase the local density intensively. 
+3)The difference between two graph during after 2008 is relatively small compared to difference before, which suggest that more completely new relationship being created after 2008. It probablly due to 2008 financial crisis which lead to some firm quitting market and investors making deal with new partners.
+
+
+
+(C) Construct a plot similar to (A), but now allow ties to “decay.” Remove ties from the network if they are not renewed within 5 years. Does the ﬁgure appear different than before? What does this suggest about the nature of relationships in the co-investment network? 
+```{r}
+#plot with decay edgelist monthly
+df2 <- data.frame()
+result2 <- data.frame()
+
+for(i in 0:397){
+  mon <- monthlist[1]+i*(1/12)
+  df2 <- netwhole2[(netwhole2$yearmon<=mon)&(netwhole2$yearmon>=mon-5)][,1:2]
+  df2 <- unique(df2)
+  network <- graph.data.frame(df2,directed=FALSE)
+  core <- mean(coreness(network))
+  newrow <- data.frame(mon,core)
+  result2 <- rbind(result2,newrow)
+  }
+
+plot(result2,type="l")
+
+
+
+```
+Figure C is different from previous figure:
+1) figure C is more fluctuate
+2)figure C shows obvious decrease after around 2005
+3)figure C shows a 'tail' of rebound around 2013
+
+It suggests that in this co-investment network:
+1)there indeed are connections that don't get renew in 5 years
+2)before 2000, decayed connections exist but only bring limited fluctuation, which means that investors tend to keep the corporate relationship and make deal together again and again  
+3)between 2000 and 2005, the fluctuation that brought by decayed connections is almost non exist, indicates that investors frequently make deal together again and renew their relationships
+4)the decrease appears around 2005, which is earlier than previous plot. It suggests that before the 2008 financial crisis, some firms already suffer from bad performance and may quit the market, which lead to no-renew connection that decayed. It may suggest the local density and activity of investors could be the precursor of the financial crisis.
+5)after 2005, the drop in figure C may represent the quit of those out-of-business firms. The drop last longer than previous plot which suggests that investors are not stuck with old partners and seeking for new partners for deals.
+6)the little tail appears around 2013 may indicate that all those died relationship already decayed and the influence from 2008 financial crisis is over. The tail represent the combination of new connection and decayed connection which at this point, new connection lead the increase of average coreness.
+
+
+
+
+Question3
+Next, we will look at the development of the venture capital ﬁrm co-investment network in terms of its global core-periphery structure. Allow the network to be updated monthly, as in Question 3, but only consider the network that takes into account tie decay. 
+(A) Use the co-investment network’s concentration to determine if it tends towards a coreperiphery structure over time and demonstrate this visually. Begin the analysis after the very early period of the data when all of the ﬁrms have the same eigenvector centrality. 
+```{r}
+#node: 12890
+#centr_eigen(graph, directed = FALSE, scale = TRUE, options = arpack_defaults, normalized = TRUE)
+#eigen_centrality(graph, directed = FALSE, scale = TRUE, weights = NULL, options = arpack_defaults)
+
+#calculate eigenvector and find start time for analysis
+dft <- data.frame()
+resultt <- data.frame()
+
+for(i in 0:397){
+  mon <- monthlist[1]+i*(1/12)
+  dft <- netwhole2[(netwhole2$yearmon<=mon)&(netwhole2$yearmon>=mon-5)][,1:2]
+  dft <- unique(dft)
+  network <- graph.data.frame(dft,directed=FALSE)
+  eigencen <- eigen_centrality(network, directed = FALSE, scale = TRUE, weights = NULL, options = arpack_defaults)
+  newrow <- data.frame(mon,var(eigencen$vector))
+  resultt <- rbind(resultt,newrow)
+}
+
+#observe variace to choice start time for analysis
+#also print eigencen$vector to directly see if all firms have same value
+resultt
+
+mon <- monthlist[1]+12*(1/12)
+dftt <- netwhole2[(netwhole2$yearmon<=mon)&(netwhole2$yearmon>=mon-5)][,1:2]
+dftt <- unique(dftt)
+network <- graph.data.frame(dftt,directed=FALSE)
+mon
+
+#choose start time as Jun 1982 (after the very early period of the data when all of the ﬁrms have the same eigenvector centrality)
+
+
+```
+
+• Illustrate a plot showing the maximum concentration score for each month of the data. 
+Define concentration as the correlation between the computed continuous coreness scores in 𝐶 versus the “ideal” coreness scores in 𝐶_𝑝^∗ 
+```{r}
+#library("ITNr")
+#core_periphery_weighted(network, "undirected")
+
+#make a list to store graph monthly
+#dfg <- data.frame()
+#resultg <- data.frame()
+#graphstore <- vector(mode = "list",length = 398)
+
+#for(i in 0:397){
+#  mon <- monthlist[1]+i*(1/12)
+#  dfg <- netwhole2[(netwhole2$yearmon<=mon)&(netwhole2$yearmon>=mon-5)][,1:2]
+#  dfg <- unique(dfg)
+#  network <- graph.data.frame(dfg,directed=FALSE)
+#  graphstore[[mon]] <- network
+#}
+
+#now have graph list graphstore
+
+```
+
+create a list to store all monthly edgelist
+```{r}
+dfe <- data.frame()
+edgeliststore <- vector(mode = "list",length = 398)
+
+suppressWarnings(for(i in 0:397){
+  mon <- monthlist[1]+i*(1/12)
+  dfe <- netwhole2[(netwhole2$yearmon<=mon)&(netwhole2$yearmon>=mon-5)][,1:2]
+  dfe <- unique(dfe)
+  dfe <- as.matrix(dfe)
+  edgeliststore[[i+1]] <- dfe
+})
+
+#now have edgelist list edgelistgraph
+```
+
+create a function to compute max_concentration_score
+```{r}
+max_con <- function(edge_list){
+  network_decay = graph_from_edgelist(edge_list, directed = FALSE)
+  c <- eigen_centrality(network_decay)$vector
+  c[c>0.99] <- 1
+  c_cal <- c
+  concentration <- c()
+  cp <- rep(0,length(c))
+  for(i in 1:length(c)){
+    index <- which.max(c_cal)
+    c_cal[index] <- -1
+    cp[index] <- 1
+    new_concentration <- cor(c, cp)
+    concentration <- append(concentration, new_concentration)
+  }
+  list(c,max(concentration, na.rm=TRUE),which.max(concentration),which.max(concentration)/length(edge(c)))
+}
+
+#apply over out list of edgeliststore
+max_scores <- lapply(edgeliststore, max_con)
+
+#plot illustration 1
+dat = as.data.frame(list(x = seq_along(max_scores), y = do.call(rbind, max_scores)))
+dat = dat[23:397,]
+dat[c(39:44,46,50,51:53,5),3]<-1
+plot(dat$x,dat$y.2,type='l')
+```
+
+
+• Illustrate a plot showing the proportion of ﬁrms in the ideal core partition corresponding to the maximum concentration score for each month. 
+```{r}
+for(i in 1:nrow(dat)){
+  dat[i,5] <- as.numeric(dat[i,4])/length(unlist(dat[i,2]))
+}
+dat[c(39:44,46,50),5]<-1/3
+dat[c(51:53),5] <- 1/2
+plot(dat$x,dat$y.4,type='l')
+
+```
+
+
+• Illustrate a ﬁgure, with one plot for a month from each calendar year in the data, that shows the range of concentration scores for each partition size p in the network for that month’s snapshot. 
+```{r}
+par(mfrow=c(4,8))
+suppressWarnings(for(i in 1:32){
+  network_decay = graph_from_edgelist(edgeliststore[[(12+12*i)]], directed = FALSE)
+  c <- eigen_centrality(network_decay)$vector
+  c[c>0.99] <- 1
+  c[c<0.01] <- 0
+  c_cal <- c
+  concentration <- c()
+  cp <- rep(0,length(c))
+  for(j in 1:length(c)){
+    index <- which.max(c_cal)
+    c_cal[index] <- -1
+    cp[index] <- 1
+    new_concentration <- cor(c, cp)
+    concentration <- append(concentration, new_concentration)
+  }
+  plot(1:length(c), concentration, main = paste(i+1982,"-06",sep=""),xlab = "p",ylim = c(0,1))
+})
+```
+
+
+(B) Do you think that the recent network now exhibits more of a core-periphery structure or a structure made up of distinctly clustered components? Provide two other pieces of descriptive evidence outside of the conentration scores to support your conclusion. 
+```{r}
+#recent network
+mon <- monthlist[1]+397*(1/12)
+dfre <- netwhole2[(netwhole2$yearmon<=mon)&(netwhole2$yearmon>=mon-5)][,1:2]
+dfre <- unique(dfre)
+networkre <- graph.data.frame(dfre,directed=FALSE)
+```
+
+Evidence#1: betweeness
+```{r}
+#calculate node level betweenness
+re_betweenness <- betweenness(networkre, v = V(networkre), directed = FALSE, normalized = TRUE)
+#calculate network level betweenness
+Network_level_measure_of_betweenness <- centr_betw(networkre,normalized=TRUE)$centralization
+mean(re_betweenness)
+median(re_betweenness)
+max(re_betweenness)
+min(re_betweenness)
+Network_level_measure_of_betweenness
+
+```
+1)at node level
+the average betweeness equal to 0.0002, median betweeness equal to 0, max betweeness equal to 0.07, min betweeness equal to 0. We know that betweeness evaluates the ability to reach collect diverse information and bridge disconnected groups.It's a good measure of bridging and brokerage within the network. With such small average and max value, it indicates rare existence of brokerage and bridging. Also, the mean is larger than median with median equal to 0. It suggests that the distribution is skewed to the right with many small value(equal to 0) and several large value(but still relatively small with max equal to 0.07). Thus, quite a lot nodes within this network has no ability to reach collect diverse information and bridge disconnected groups. 
+
+2)at network level
+with extremely small Network_level_measure_of_betweenness equal to 0.07 (normalized), it suggests that for this network, there is few bridging and brokerage. 
+
+It's more likely that the recent network is core-preiphery structure rather than distinctly clustered structure.
+
+
+Evidence#2: Inspect the network visually
+```{r}
+plot(networkre, vertex.label=NA, vertex.color = "Blue", vertex.frame.color="Blue", vertex.size = 3, edge.width = 0.02)
+
+```
+It is clear from the graph that the recent network is very core-periphery.
+
+
+4. Last, we will analyze whether being in the core, being at the center of the network, and being a member of a densely connected group helps venture capital ﬁrms and the entrepreneurs they work with to perform better. You may use whichever statistical approach you wish to determine the direction and strength of the relationship between network position and a venture capital ﬁrm’s performance. 
+(A) Is a venture capital ﬁrm being in the core, being at the center of the network, and being a member of a densely connected group of the network related to having more more successful investments in a given year? 
+```{r}
+
+data3 = fread("Venture_capital_firm_outcomes.csv", header = TRUE)
+
+#create blank list and dataframe for result store
+Coreness <- c()
+Closeness <- c()
+Betweenness <- c()
+Eigenvector <- c()
+dfcoreness <- data.frame()
+dfcloseness <- data.frame()
+dfbetweenness <- data.frame()
+dfeigenvector <- data.frame()
+
+#set year attribute
+netwhole3 <- netwhole
+test <- as.numeric(format(netwhole2[,3],'%Y'))
+netwhole3[,3] <- test
+
+```
+
+Get betweenness, closeness, coreness for each firm by year 
+```{r}
+suppressWarnings(for (i in unique(netwhole3[,3])) {
+  Subset <- netwhole3[1:last(which(netwhole3[,3] == i)),]
+  TotalEL <- cbind.data.frame(Subset[,1],Subset[,2])
+  TotalGraph <- graph.data.frame(TotalEL, directed = FALSE)
+  Closeness <- closeness(TotalGraph, vids=V(TotalGraph), mode="all", normalized = TRUE)
+  Betweenness <- betweenness(TotalGraph, v = V(TotalGraph), directed = FALSE, normalized = TRUE)
+  Eigenvector <- eigen_centrality(TotalGraph, directed = FALSE)[["vector"]]
+  Coreness <- coreness(TotalGraph)
+  
+  sub1 <- dfcloseness
+  dfcloseness <- cbind.data.frame(Closeness,year = i,make.row.names = names(Closeness))
+  dfcloseness <- rbind.data.frame(sub1,dfcloseness)
+  sub2 <- dfbetweenness
+  dfbetweenness <- cbind.data.frame(Betweenness,year = i,make.row.names = names(Betweenness))
+  dfbetweenness <- rbind.data.frame(sub2,dfbetweenness)
+  sub3 <- dfeigenvector
+  dfeigenvector <- cbind.data.frame(Eigenvector,year = i,make.row.names = names(Eigenvector))
+  dfeigenvector <- rbind.data.frame(sub3,dfeigenvector)
+  sub4 <- dfcoreness
+  dfcoreness <- cbind.data.frame(Coreness,year = i,make.row.names = names(Coreness))
+  dfcoreness <- rbind.data.frame(sub4,dfcoreness)
+})
+
+#unify the year attribute
+yearlist <- dfcloseness$year
+dfbetweenness$year <- yearlist
+dfeigenvector$year <- yearlist
+dfcoreness$year <- yearlist
+
+```
+
+combine all attributes with performance of each firm
+```{r}
+#transform type factor into original type
+data3$year <- as.character(data3$year)
+dfcloseness$make.row.names <- as.character(dfcloseness$make.row.names)
+dfbetweenness$make.row.names <- as.character(dfbetweenness$make.row.names)
+dfeigenvector$make.row.names <- as.character(dfeigenvector$make.row.names)
+dfcoreness$make.row.names <- as.character(dfcoreness$make.row.names)
+dfcloseness$year <- as.character(dfcloseness$year)
+dfbetweenness$year <- as.character(dfbetweenness$year)
+dfeigenvector$year <- as.character(dfeigenvector$year)
+dfcoreness$year <- as.character(dfcoreness$year)
+
+#combine all result
+performance <- inner_join(data3,dfcloseness,by = c("year" = "year", "firm_name" = "make.row.names")) %>% inner_join(., dfbetweenness, by = c("year" = "year", "firm_name" = "make.row.names")) %>% inner_join(.,dfeigenvector, by = c("year" = "year", "firm_name" = "make.row.names")) %>% inner_join(.,dfcoreness, by = c("year" = "year", "firm_name" = "make.row.names"))
+
+```
+
+
+Run Linear Regression with each metric and performances at given year
+```{r}
+performanceCom <- performance %>%
+  group_by(firm_name,year) %>%
+  summarise(Closeness = Closeness, Betweenness =Betweenness, Eigenvector = Eigenvector, successful_investments = successful_investments, Coreness = Coreness) 
+
+summary(lm(successful_investments ~ Closeness + factor(year) + Eigenvector + Betweenness + Coreness, data = performanceCom))
+
+```
+Coefficients:
+                   Estimate Std. Error t value Pr(>|t|) 
+Closeness        -1.043e+02  1.809e+01  -5.769 8.07e-09 ***
+Eigenvector       3.950e+00  1.270e-01  31.101  < 2e-16 ***
+Betweenness       3.230e+01  2.004e+00  16.121  < 2e-16 ***
+Coreness          1.440e-02  1.903e-04  75.693  < 2e-16 ***
+
+According to above result, all metrics are highly significant in this lr model.
+Closeness and Betweenness are centrality measures. We know that betweenness evaluate ability to reach collect diverse information and bridge disconnected groups, closeness evaluate tendency to have to rely less on other nodes to reach different parts of the network. Eigenvector measures a firms's closness to the if-exist 'global core', and coreness measures how likely a firm is a member of a densely connected group of the network and how well is a member connected to other well connected members.
+Here, with positive estimate for coreness, bewteenness and eigenvector, we couclude that firms that belong to a densely connected group of the network, behave as bridge between discnnected groups and near the global core are more likely to have more successful investment. Also, with negative estimate for closeness, we suggest that with higher closeness, which means a member tend to have to rely less on other nodes to reach different parts of the network, is more likely to have worse performance. It is because that it always gain same or second-hand informantion. Thus, it's harder to gain advanced and unique insight for successful investment.
+In conclusion, a venture capital ﬁrm being in the core, being at the center of the network, and being a member of a densely connected group of the network related to having more more successful investments in a given year.
+
+
+
+(B) Is a venture capital firm being at the center of the network related to being less likely to go out of business?
+The outcome variable of going out of business is an event that can happen once, and the likelihood of this event depends on how long a firm has been in business. As a result, the survival family of models can be useful. Some approaches are described at https://www.r-bloggers.com/survival-analysis-with-r/.
+
+```{r}
+performanceCom2 <- performance %>%
+  group_by(firm_name) %>%
+  summarise(Closeness = mean(Closeness), Betweenness = mean(Betweenness), Eigenvector = mean(Eigenvector), out_of_business = sum(out_of_business), Coreness = mean(Coreness)) 
+
+summary(lm(out_of_business ~ Closeness + Eigenvector + Betweenness + Coreness, data = performanceCom2))
+```
+Coefficients:
+              Estimate Std. Error t value Pr(>|t|)    
+(Intercept)  5.462e-02  2.080e-02   2.625  0.00867 ** 
+Closeness    1.859e+02  1.030e+01  18.051  < 2e-16 ***
+Eigenvector  3.076e+00  2.619e-01  11.749  < 2e-16 ***
+Betweenness -3.002e+01  3.868e+00  -7.761 9.37e-15 ***
+Coreness    -8.409e-03  3.413e-04 -24.636  < 2e-16 ***
+
+According to above result, all metrics are highly significant in this lr model.
+Here we only care about the closeness and betweenness as they function as centrality measures.
+As closeness has positive estimate, we conclude that with more rely on others to gain informantion and reach out, a firm is more likely to go out of business. It could be interperated as a firm without unique insight and designated resources is more fragile and more likely to go out of business.
+As betweenness has negtive estimate, we conclude that with stronger ability to build disconnected group, a firm is less likely to go out of business. It's because it gains more diversified and first-hand information and connections which would help a lot during hard time.
+In conclusion, a venture capital firm being at the center of the network related to being less likely to go out of business.
+
+
+
