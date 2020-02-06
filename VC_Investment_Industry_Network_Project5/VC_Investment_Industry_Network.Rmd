@@ -1,0 +1,771 @@
+---
+title: "Assignment 5 - Meng Cheng"
+author: "Meng Cheng"
+date: "12/2/2019"
+output: html_notebook
+---
+
+Import required package
+```{r, message=FALSE, warning=FALSE}
+library(igraph)
+library(Matrix)
+library(gdata)
+library(proxy)
+library(plm)
+library(ggplot2)
+library(data.table)
+library(dplyr)
+library(zoo)
+library(stringr)
+```
+
+Import dataset and pre clean the data
+```{r, message=FALSE, warning=FALSE}
+#import dataset
+data1 <- fread("company_details.csv", header = TRUE)
+data2 <- fread("deal_details.csv", header = TRUE)
+data3 <- fread("investor_details.csv", header = TRUE)
+data4 <- fread("investors_and_deals.csv", header = TRUE)
+
+#only consider in the analysis investors of the Venture Capital type
+data3 <- data3[which(data3$Investor_Type=="Venture Capital"),]
+
+
+#only consider deals that have occurred from 1990 onward
+#remove missing date information
+data2 <- data2[which(data2$Deal_Date!=""),]
+
+#transform date into year
+data2$Year <- as.integer(str_sub(data2$Deal_Date,-2))
+
+changeY <- function(x){
+  if(x<=18){
+    x = x+2000
+  }
+  else{
+    x = x+1900
+  }
+  return(x)
+}
+
+data2$Year <- sapply(data2$Year,changeY)
+data2 <- data2[which(data2$Year>=1990),]
+
+#only consider deals that have non-missing entries for "Primary_Industry_Sector"
+data1 <- data1[!is.na(data1$Primary_Industry_Code),]
+names(data2)[1] <- "Deal_Id"
+data2 <- data2[which(data2$CompanyId %in% data1$CompanyID),]
+
+
+#filter investor, deal and company relation based on above selection
+data4 <- data4[which(data4$Deal_Id%in%data2$Deal_Id),]
+names(data3)[1] <- "Investor_Id"
+data4 <- data4[which(data4$Investor_Id%in%data3$Investor_Id),]
+
+```
+
+
+# Question 1
+
+
+## Construct the status matrix
+
+add deal year information to investor/deal data
+```{r, message=FALSE, warning=FALSE}
+#no missing value for lead_investor
+unique(data4$Lead_Investor)
+
+#all qulified deal
+dataclean <- merge(data4[,c(1,2,4)],data2[,c(1,32)],by="Deal_Id") 
+
+```
+
+incidence matrix
+```{r, message=FALSE, warning=FALSE}
+#only consider co-investment
+d1 <- dataclean %>%
+  group_by(Deal_Id) %>%
+  summarise(count=length(unique(Investor_Id)))
+
+##find co-investment event
+d2 <- d1[which(d1$count>1),]
+
+##keep only data for co-investment
+d3 <- dataclean[which(dataclean$Deal_Id%in%d2$Deal_Id),]
+
+##not all co-investment events have lead investor
+t1 <- d3 %>%
+  group_by(Deal_Id)%>%
+  summarise(sum=sum(Lead_Investor))
+t2 <- t1[which(t1$sum>0),]
+
+yearlist <- sort(unique(d3$Year))
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+#method1
+#try to store adj matrix in a list but memory not enough and take too long to run
+
+#construct incidence matrix for co-investments and transform it to adj matrix by year
+#sharemtx1 <- list()
+#for(i in 1:length(yearlist)){
+#  yearsel<-yearlist[i]
+#  g1 <- d4[which(d4$Year==yearsel),]
+#  g2 <- as.matrix(data.frame(dcast(g1[,c(1,2)], Investor_Id ~ Deal_Id, fun.aggregate=length), row.names = 1))
+#  g3 <- g2%*%t(g2)
+#  diag(g3) <- 0
+#  sharemtx1[[i]] <- g3
+#}
+
+#method2
+#1. construct incidence matrix for co-investments
+#2. transform it to adj matrix by year
+#3. transform it to edge list with weight and year
+
+#use tcrossprod() and sparse matrix for faster matrix multiplication 
+
+shareedgelist <- data.table()
+for(yearsel in yearlist){
+  g1 <- d3[which(d3$Year==yearsel),]
+  g2 <- as.matrix(data.frame(dcast(g1[,c(1,2)], Investor_Id ~ Deal_Id, fun.aggregate=length), row.names = 1),sparse = TRUE)
+  g3 <- tcrossprod(g2,g2)
+  diag(g3) <- 0
+  g4<- graph.adjacency(g3,weighted=TRUE,mode = "undirected")
+  res <- get.data.frame(g4)
+  res$year <- yearsel
+  shareedgelist <- rbind(shareedgelist,res)
+}
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+#for each year, consider recent 5 year co-investment count
+sharecount <- data.table()
+for(yearsel in yearlist){
+  g1 <- shareedgelist[which((shareedgelist$year<=yearsel)&(shareedgelist$year>yearsel-5)),] %>%
+    group_by(from,to) %>%
+    summarise(year=yearsel,count=sum(weight))
+  sharecount <- rbind(sharecount,as.data.frame(g1))
+}
+#write.csv(sharecount,"sharecount.csv")
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+#lead investment
+leadedgelist <- data.table()
+d4 <- d3[which(d3$Deal_Id%in%t2$Deal_Id),]
+coinvestlist <- unique(d4$Deal_Id)
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+for(dealsel in coinvestlist){
+  g1 <- d4[which(d4$Deal_Id==dealsel),]
+  g2 <- expand.grid(unlist(g1[which(g1$Lead_Investor==1),2]),unlist(g1[,2]))
+  g2$year <- g1$Year
+  leadedgelist <- rbind(leadedgelist,g2)
+}
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+colnames(leadedgelist) <- c("lead","non","year")
+#write.csv(leadedgelist,"leadedgelist.csv")
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+#for each year, consider recent 5 year co-investment lead count
+leadcount <- data.table()
+for(yearsel in yearlist){
+  g1 <- leadedgelist[which((leadedgelist$year<=yearsel)&(leadedgelist$year>yearsel-5)),] %>%
+    group_by(lead,non) %>%
+    summarise(year=yearsel,count=n())
+  leadcount <- rbind(leadcount,as.data.frame(g1))
+}
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+#adjust data type
+leadcount$lead <- as.character(leadcount$lead)
+leadcount$non <- as.character(leadcount$non)
+
+#make sure to have the dia value equal to 0
+leadcount <- leadcount[which(leadcount$lead!=leadcount$non),]
+colnames(leadcount) <- c("lead","non","year","leadshare")
+
+#write.csv(leadcount,"leadcount.csv")
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+#construct whole sharecount list
+#have v1 -> v2 and v2 -> v1
+sharecount <- sharecount[which(sharecount$from!=sharecount$to),]
+sharecount1 <- cbind(sharecount[,2],sharecount[,1],sharecount[,c(3,4)])
+colnames(sharecount1) <- c("from","to","year","count")
+sharecount <- rbind(sharecount,sharecount1)
+colnames(sharecount) <- c("lead","non","year","countshare")
+
+#combine share and co-investment information
+status <- merge(sharecount,leadcount,by=c("lead","non","year"),all.x = TRUE)
+status[which(is.na(status$leadshare)),5] <- 0
+
+#as defination 
+status$value <- status$leadshare/status$countshare
+status1 <- status[,c(1,2,3,5)]
+colnames(status1)[4]<-"weight"
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+#get eiigenvector centrality of the matrix as status
+status2 <- data.table()
+for(yearsel in yearlist){
+  g1 <- status1[which(status1$year==yearsel),c(1,2,4)]
+  g2 <- graph.data.frame(g1,directed=TRUE)
+  g3 <- eigen_centrality(g2, directed = TRUE, weights = NULL)$vector
+  g4 <- as.data.table(cbind(names(g3),unname(g3)))
+  g4$year <- yearsel
+  status2 <- rbind(status2,g4)
+}
+
+#write.csv(status2,"status2.csv")
+
+```
+
+```{r}
+status2 <- fread("status2.csv",header = TRUE)[,c(2:4)]
+```
+
+# Question1A
+Traditionally, venture capital analysis have only considered the concentration of a venture capital firms investments in to different portfolio categories. The more concentrated a firm's investments, the less diversified it is. 
+
+### calculate Herfindahl index 
+```{r, message=FALSE, warning=FALSE}
+#unique category
+categorylist <- unique(data1$Primary_Industry_Code)
+
+#load lpackage hhi for herfindahl index calculation
+library("hhi")
+
+#combine whole qualified deal data and company type data
+data5 <- merge(dataclean,data2[,c(1,2)],by="Deal_Id",all.x = TRUE)
+colnames(data5)[5]<-"CompanyID"
+data5 <- merge(data5,data1[,c(1,8)],by="CompanyID",all.x = TRUE)
+
+#group by each year/firm for percentage of each sector
+data6 <- data5 %>%
+  group_by(Investor_Id,Year,Primary_Industry_Code) %>%
+  summarise(count=n())%>%
+  group_by(Investor_Id,Year) %>% 
+  mutate(Percentage=count/sum(count)*100)
+
+#table concentration to store herfindahl index
+concentration <- unique(data6[,c(1,2)])
+concentration$con <- NA
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+#get concentration
+for(i in (1:dim(concentration)[1])){
+  g1 <- data6[(which((data6$Investor_Id==concentration[i,]$Investor_Id)&(data6$Year==concentration[i,]$Year))),c(3,5)]
+  g2 <- hhi(as.data.frame(g1),"Percentage")
+  concentration[i,3] <- g2
+}
+
+#write.csv(concentration,"concentration.csv")
+```
+
+```{r, message=FALSE, warning=FALSE}
+#import saved data from above code
+concentration <- fread("concentration.csv", header = TRUE)[,c(2:4)]
+```
+
+
+control variable 1
+whether a venture capital firm tends to originate its own deals: for more than 50% of the companies it invests in, it invests in the first investment round this company has received 
+```{r, message=FALSE, warning=FALSE}
+datac1 <- data5
+datac1[, first_round := ifelse(Year==min(Year),1,0), by=list(CompanyID)]
+
+#group by each year/firm for number of total investment and if first_round
+datac1r <- datac1 %>%
+  group_by(Investor_Id,Year) %>%
+  summarise(yearinvestment=n(),yearfirst=sum(first_round))%>%
+  group_by(Investor_Id) %>%
+  mutate(total=cumsum(yearinvestment),totalfirst=cumsum(yearfirst))
+datac1r <- as.data.table(datac1r)
+
+#if more than 50% are in the first investment round
+datac1r[,first_round := ifelse(totalfirst/total>0.5,1,0)]
+
+
+```
+
+
+control variable 2
+whether a venture capital ???rm tends to invest in the IT sector: more than 50% of the companies it invests in are in the company-level variable Primary Industry Sector "Information Technology"
+```{r, message=FALSE, warning=FALSE}
+datac2 <- data5
+datac2 <- merge(datac2,data1[,c(1,6)],by="CompanyID",all.x = TRUE)
+datac2[, IT := ifelse(Primary_Industry_Sector=="Information Technology",1,0)]
+
+#group by each year/firm for number of total investment and if IT
+datac2r <- datac2 %>%
+  group_by(Investor_Id,Year) %>%
+  summarise(yearinvestment=n(),yearit=sum(IT))%>%
+  group_by(Investor_Id) %>%
+  mutate(total=cumsum(yearinvestment),totalit=cumsum(yearit))
+datac2r <- as.data.table(datac2r)
+
+#if more than 50% are in IT sector
+datac2r[,IT := ifelse(totalit/total>0.5,1,0)]
+
+
+```
+
+
+control variable 3
+whether a venture capital firm tends to invest in early-stage startups: more than 50% of the companies it invests in are of the Deal Type 1 "Early Stage VC", "Accelerator/Incubator", "Seed Round", or "Angel (individual)"
+```{r, message=FALSE, warning=FALSE}
+datac3 <- data5
+datac3 <- merge(datac3,data2[,c(1,9)],by="Deal_Id",all.x = TRUE)
+datac3[, type := ifelse(Deal_Type_1=="Early Stage VC"|Deal_Type_1=="Accelerator/Incubator"|Deal_Type_1=="Seed Round"|Deal_Type_1=="Angel (individual)",1,0)]
+
+#group by each year/firm for number of total investment and if specific types
+datac3r <- datac3 %>%
+  group_by(Investor_Id,Year) %>%
+  summarise(yearinvestment=n(),yeartype=sum(type))%>%
+  group_by(Investor_Id) %>%
+  mutate(total=cumsum(yearinvestment),totaltype=cumsum(yeartype))
+datac3r <- as.data.table(datac3r)
+
+#if more than 50% are in early stage startups
+datac3r[,early := ifelse(totaltype/total>0.5,1,0)]
+```
+
+
+merge regression data together
+```{r, message=FALSE, warning=FALSE}
+q1a <- merge(datac1r,datac2r,by=c("Investor_Id","Year"))
+q1a <- merge(q1a,datac3r,by=c("Investor_Id","Year"))
+q1a <- q1a[,c(1,2,7,12,17)]
+colnames(status2) <- c("Investor_Id","score","Year")
+q1a <- merge(q1a,status2,by=c("Investor_Id","Year"))
+q1a <- merge(q1a,concentration,by=c("Investor_Id","Year"))
+
+```
+
+get lag value for control variables and status variable
+```{r, message=FALSE, warning=FALSE}
+q1a$score <- as.numeric(q1a$score)
+q1a <- 
+    q1a %>%
+    group_by(Investor_Id) %>%
+    mutate(lag_status = dplyr::lag(score, n = 1, default = NA),lag_early = dplyr::lag(early, n = 1, default = NA),
+           lag_IT = dplyr::lag(IT, n = 1, default = NA),lag_first = dplyr::lag(first_round, n = 1, default = NA))
+
+q1areg <- q1a[,c(1,2,7:11)]
+
+q1areg1 <- as.data.table(na.omit(q1areg))
+
+
+```
+
+
+
+regression
+```{r, message=FALSE, warning=FALSE}
+summary(plm(con ~ lag_status + I(lag_status^2)+ lag_first + lag_IT + lag_early + Year, q1areg1, effect = "individual", model = "within", index = "Investor_Id"))
+
+```
+
+
+### INSIGHT 
+
+What is the relationship between status and diversification?
+
+According to above regression, lag_status has negative effect and the square of lag_status has positive effect on the concentration level of the investments of a venture capital at the confidence level of 0 which is highly significant.
+It suggests that at first, the increase of a firm's status contributes to the diversification of its investments, but when the status reach a certain level, the increase of a firm's status tends to lower the diversification of the firm's investments.
+
+Take control variables into account, both first_round and early_stage show significant negtive effect on the concentration level. We can conclude that with same status in the previous year, a firm that tends to originate its own deals or tends to invest in early-stage startups is more likely to have more diversified investment profile in this year.
+
+
+# Question 1b
+
+Create a new measure of diversi???cation that takes the relatedness of industry categories into account. First compute the relatedness of each industry category as the Jaccard distance between each pair of industry categories for each year, using the company-level variable "Primary Industry Code". Base the similarity on the co-occurrence of industry categories in investors' portfolios cumulative to the current year.
+
+```{r, message=FALSE, warning=FALSE}
+#new table to store niche_width value for each year each firm
+niche_width <- data.table()
+
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+data1b <- data5[,c(3,5,6)]
+
+#get relatedness each industry category as the jacard distance between each pair of industry categories for each year
+for(yearsel in yearlist){
+  subpair <- data1b[data1b$Year<=yearsel,c(1,3)]
+  g1 <- data.frame(dcast(subpair, Primary_Industry_Code ~ Investor_Id,fun.aggregate=length), row.names = 1)
+  g1[g1>1] <- 1
+  #get dist matrix
+  g2 <- as.matrix(dist(g1))
+  
+  #get industry combination for each investor 
+  subin <- unique(subpair)
+  
+ 
+  subin[, indcount := .N , by ='Investor_Id']
+  
+  #get total industry
+  res1 <- unique(subin[,c(1,3)])
+  
+  #only consider investors that have invested in more than one type of industries
+  subin1 = subin[indcount>1]
+  
+  #combination
+  comb<- subin1[,as.data.table(t(combn(Primary_Industry_Code,2))), by='Investor_Id']
+  comb<- as.data.frame(comb)
+  comb <-comb[complete.cases(comb), ]
+  comb <- comb[!((comb$V1=="") | comb$V2==""), ]
+  
+  for(i in (1:nrow(comb))){
+    comb[i,'distance']<- g2[comb[i,2],comb[i,3]]
+  }
+  
+  #sum distance
+  res <- comb %>%
+    group_by(Investor_Id)%>%
+    summarise(sum_dist=sum(distance))
+  resw <- merge(res1,res,by="Investor_Id",all.x = TRUE)
+  resw$Year <- yearsel
+  niche_width <- rbind(niche_width,resw)
+  
+}
+
+#write.csv(niche_width,"niche_width.csv")
+
+```
+
+```{r}
+#niche_width <- fread("niche_width.csv",header=TRUE)[,c(2:5)]
+```
+
+
+regression
+```{r, message=FALSE, warning=FALSE}
+
+niche_width$nw <- 1-(1/(1+niche_width$sum_dist/(niche_width$indcount-1)))
+niche_width <- as.data.table(niche_width)
+
+#If an investor only invests in a single industry category, set the niche_width equal to 0
+niche_width[which(is.na(niche_width$nw)),5]<-0
+
+
+q1b <- merge(q1a,niche_width[,c(1,4,5)],by=c("Investor_Id","Year"))
+q1b <- as.data.table(q1b)
+
+#The approach for incorporating fixed effects for this model is different: include in the model the average values for all of the predictors, except for the year, for each firm over itslifetime.
+q1b[,avg_status:= mean(score,na.rm=TRUE), by=Investor_Id]
+q1b[,avg_status_squared := mean(score^2,na.rm=TRUE), by=Investor_Id]
+q1b[,avg_First_Round:= mean(first_round,na.rm=TRUE), by=Investor_Id]
+q1b[,avg_IT_Sector:= mean(IT,na.rm=TRUE), by=Investor_Id]
+q1b[,avg_Early_Stage:= mean(early,na.rm=TRUE), by=Investor_Id]
+
+#regression
+summary(glm(nw ~ lag_status + I(lag_status^2)+ lag_first + lag_IT + lag_early + avg_status + avg_status_squared+avg_First_Round + avg_IT_Sector + avg_Early_Stage + Year, q1b, family = quasibinomial(link = "logit")))
+
+
+
+```
+
+## INSIGHT
+
+What is the relationship between status and diversification?
+
+According to above regression result, the lag value of status have positive effect and it's square term have negative effect on the level of dicersification of a firm's investments with significant on 0 confidence level. It suggests that venture capital with high and low status both have lower diversification level in their investment profolio while middle status venture capital tends to have higher diversification level in their investment profolio.
+
+Take control variable into account, the lag value of a firm's tendency of investing in first round and early stage show negative effect with significance. We can conclude that with same status in the previous year, a firm that tends to originate its own deals or tends to invest in early-stage startups is more likely to have less diversified investment profile in this year. 
+
+
+
+## Question 1c
+Next, let's check the shape of the regression curve to get a sense of the parabolic curvature. 
+```{r, message=FALSE, warning=FALSE}
+#First, re-run the regression from 1B just using lagged status and the status squared term and not using any of the additional controls.
+reg_1c <-glm(nw ~ lag_status + I(lag_status^2), q1b, family = quasibinomial(link = "logit"))
+
+#set up a data object with a range of values of the lagged status variable-100 values ranging from the minimum to the maximum of this variable.
+data <- data.frame(seq(min(q1b$lag_status,na.rm=TRUE), max(q1b$lag_status,na.rm=TRUE), length = 100))
+colnames(data) <- 'lag_status'
+preds <-predict(reg_1c,data,se.fit = TRUE)
+
+
+# Plot
+plot(x = data$lag_status, y = preds$fit,type = 'l',xlab="Lagged Status", ylab="Diversi???cation (Niche Width)")
+polygon(c(data$lag_status,rev(data$lag_status)),c(preds$fit-1.95*preds$se.fit,rev(preds$fit+1.95*preds$se.fit)),col = rgb(1, 0, 0,0.5), border = NA)
+
+lines(x= data$lag_status, y = preds$fit+1.96*preds$se.fit, lty = 'dashed', col = 'blue')
+lines(x= data$lag_status, y = preds$fit-1.96*preds$se.fit, lty = 'dashed', col = 'blue')
+
+```
+
+
+### INSIGHT
+
+What does the curve suggest about the diversification strategies of low, middle, and high-status venture capital firms?
+
+The curve suggests that high-status venture capital and low status venture capital hiave lower diversification in their investment profolio while middle status venture capital firms tend to have higher diversification. Firms with extrem high status have even lower diversification strategies compared to firms with extrem low status.
+
+As we also plot the 95% confidence intervals for the fitted values, we can observe from the plot that middle-status venture capital are more varied in their level of diversification while low-status venture capital do not vaired much in the diversification strategies.
+
+
+## Question 2
+Which venture capital firms are more effective at diversifying their portfolios? 
+
+### A
+```{r, message=FALSE, warning=FALSE}
+data2a <- datac3
+data2a[, type := ifelse(Deal_Type_1=="Merger/Acquisition"|Deal_Type_1=="IPO"|Deal_Type_1=="Buyout/LBO",1,0)]
+
+#group by each year/firm for number of cum successful investment
+data2ar <- data2a %>%
+  group_by(Investor_Id,Year) %>%
+  summarise(yearsucc=sum(type))%>%
+  group_by(Investor_Id) %>%
+  mutate(totalsucc=cumsum(yearsucc))
+data2ar <- as.data.table(data2ar)
+
+
+```
+
+```{r, message=FALSE, warning=FALSE}
+#regression
+#Run a appropriate regression,considering the form of the outcome variable and incorporating venture capital firm fixed effects, predicting the number of successful investments as a function of lagged status, lagged diversification, and interaction of lagged status and lagged diversification. 
+#Use the niche width measure of diversification and include the same controls from the regressions from 1A and 1B. 
+
+#get lag diversification
+q2a <- merge(q1b,data2ar,by=c("Investor_Id","Year"))
+
+q2a <- q2a %>%
+    group_by(Investor_Id) %>%
+    mutate(lag_nw = dplyr::lag(nw, n = 1, default = NA))
+
+
+# Regression
+summary(glm(totalsucc ??? lag_status + lag_nw + lag_status:lag_nw + lag_first + lag_IT + lag_early + Year , q2a,family = poisson))
+
+
+
+```
+
+
+## INSIGHT
+
+Is this interaction related to having more successful investments?
+
+This interaction has positive coefficient with highly siginificance. It suggests that this interaction is related to having more successful investment. Both lag_status and lag_nw(diviersification) have significant effect from the regression, and lag_status has negative effect while lag_nw has positive effect. 
+
+It indicates that there is a synergistic effect of the two variables-high levels of both together(high-status with high diversification level of the investment profolio) have a positive effect on the outcome variable-more successful investments.  
+
+
+
+## B
+
+Similar to 1C, we can use a visualization to better understand the relationship between the variables in the regression. We can accomplish this using a 3d scatterplot or a contour plot generated from the ???tted values of the model. 
+```{r, message=FALSE, warning=FALSE}
+#Re-run a similar model from 2A with just lagged status and lagged diversification and without using firm fixed effects,
+#e.g.,using glm()withfamily = "poisson",and assign it to an object. 
+
+reg_2b <- glm(totalsucc ??? lag_status + lag_nw, q2a,family = poisson)
+
+
+#Next, generate a range ofvalues for lagged status and lagged diversification, similar to 1C. Use the function expand.grid() to range of combinations of status and diversification
+data <- data.frame(seq(min(q2a$lag_status,na.rm=TRUE), max(q2a$lag_status,na.rm=TRUE), length = 100),seq(min(q2a$lag_nw,na.rm=TRUE), max(q2a$lag_nw,na.rm=TRUE), length = 100))
+colnames(data) <- c('lag_status','lag_nw')
+
+
+#and then use predict to get the fitted values for each combination of diversification and status. Below is some code that will generate a 3d scatterplot. 
+data <- expand.grid(data) 
+
+preds <-predict(reg_2b,data)
+values <- cbind(data,preds)
+colnames(values)<-c("status","diversification","successful_investments")
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+library(rgl)
+library(plot3D)
+library(plotly)
+
+# regular 3d plot 
+scatter3D(values$diversification, values$status, values$successful_investments)
+
+```
+
+```{r, message=FALSE, warning=FALSE}
+# interactive 3d plot
+plot3d(values$diversification, values$status, values$successful_investments) 
+
+```
+
+
+```{r, message=FALSE, warning=FALSE}
+# A contour plot can be executed in a similar manner using the following code, from the plotly package.
+colnames(values)<-c("status","niche_width","fit")
+p1 = plot_ly(
+  values,
+  x = ~status, 
+  y = ~niche_width,
+  z = ~fit, 
+  type = "contour",
+  autocontour = FALSE, 
+  contours = list( end = max(values$fit, na.rm = TRUE), 
+                   size = abs(max(values$fit, na.rm = TRUE) - min(values$fit, na.rm = TRUE))/20,
+                   start = min(values$fit, na.rm = TRUE), showlines = FALSE ),
+  line = list(smoothing = 0.85),
+  colorscale = "Greys" 
+  ) %>% 
+  colorbar(len = 1, nticks = 10, title = "Estimated successful \n investments") %>% 
+  layout(yaxis = list(title = "Niche width")) %>% 
+  layout(xaxis = list(title = "Status")) 
+p1
+
+```
+
+## INSIGHT
+
+What do the patterns suggest about which venture capital firms are most or least successful overall at diversifying their portfolios?
+
+According to above patterns, we can conclude that firms with lower status, lower diversification level tend to have more successful investment. It suggests that with same amount of successful investments, low-status venture capitals diversify their portfolios more effective and have higher level of diversification.
+
+
+## Question 3
+The parabolic relationships from 1B and 1C suggest that low and high-status venture capital firms may share similar tendencies to diversify, but the estimates from 2A suggest that highstatus firms are better at diversifying. Why might this be the case?
+
+```{r, message=FALSE, warning=FALSE}
+#no time to run this part of code but have thought about the logic and show here
+
+# Create an empty datatable to store information about each investor's coordinates
+coord <- data.table()
+
+for(i in yearlist){
+  # For each year, take a sub-dataset of previous years.
+  invest_sub <- as.data.table(subset(data5, year<=i))
+  # First create an affiliation matrix. 1 indicates that this industry category has occured in the firm's portfolio.
+  jac_dist <- as.data.frame(invest_sub[,c(3,6)])
+  jac_dist <- unique(na.omit(jac_dist))
+  jac_dist$occur <- 1
+  jac_dist_matrix <- acast(jac_dist,Investor_Id ~ Primary_Industry_Code,value.var="occur")
+  jac_dist_matrix[is.na(jac_dist_matrix)] = 0
+  jac_dist_matrix[jac_dist_matrix>=1] = 1
+  # Use a multidimensional scaling of two dimensions to determine the position 
+  coord_result <-as.data.frame(cmdscale(as.data.frame(as.matrix(proxy::dist(jac_dist_matrix,method ="jaccard")))))
+  colnames(coord_result) <- c('C1','C2')
+  coord_result$Investor_Id <- rownames(jac_dist_matrix)
+  
+  # Combine this year's information to the main concentration_score datatable
+  coord_result$year <- i
+  coord  <- rbind(coord, coord_result)
+}
+
+
+coord <- fread("coord.csv",header = TRUE)
+industry_medoids <- data5[,c("Investor_Id","Deal_Id","Primary_Industry_Code","Year")]
+industry_medoids <- as.data.table(industry_medoids)
+industry_medoids[,count:=.N, by=c("Year","Primary_Industry_Code","Investor_Id")]
+
+# If a venture capital firm that only invests in that category in a particular year, it should instead become the medoid.
+industry_medoids[,medoid:= ifelse(length(unique(Primary_Industry_Code))==1,1,0), by=c('Year','Investor_Id')]
+
+# Check whether there is a medoid for this industry after the first step.
+industry_medoids[,medoid_exist:= ifelse(sum(medoid)>0,1,0), by=c('Year','Primary_Industry_Code')]
+
+# Then if no ???rms invest exclusively in the category, I just used as the medoid the ???rm with the most investments in this category. 
+industry_medoids[,medoid:= ifelse(medoid_exist==0,count==max(count),medoid),by=c('Year','Primary_Industry_Code')]
+
+# Double cheCK there is a medoid for every row's category.
+industry_medoids[,medoid_exist2:= ifelse(sum(medoid)>0,1,0), by=c('Year','Primary_Industry_Code')]
+
+
+# Only keep medoid of industry category in the data table
+industry_medoids <- industry_medoids[medoid==1][,c(1,3,4)]
+industry_medoids <- left_join(industry_medoids, coord[,c(2:5)], by=c('Year','Investor_Id'))
+# Only keep one medoid for each categroy in each year
+industry_medoids <- as.data.table(industry_medoids)
+industry_medoids <- industry_medoids[, head(.SD, 1), by=c('Year','Primary_Industry_Code')]
+colnames(industry_medoids)[3:5] <- c('Medoid',"Medoid_C1","Medoid_C2")
+
+
+# Join coordinates of each deal and medoid coordinate of each category back to the main data table
+data3a <- data5
+data3a <- left_join(data3a, coord, by=c('year','Investor_Id'))
+data3a <- left_join(data3a, industry_medoids[,c(1,2,4,5)], by=c('year','Primary_Industry_Code'))
+data3a <-as.data.table(data3a)
+
+# For each deal, de???ne the distance between a ???rm's experience and the industry category 
+data3a[,experience_diffence:= sqrt((Medoid_C1-C1)^2+(Medoid_C2-C2)^2)]
+
+# Calculate the average distance between a ???rm's syndicate partners and the industry category medoids for the deals that it invests in in a given year
+# First sum the differences by deal each year
+data3a[,Deal_Sum:= sum(experience_diffence),by=c('Year','Deal_Id')]
+# Then sum the differences of all the deals that an investor invest in each year
+data3a[,Investor_Partners_Sum:=sum(Deal_Sum),by=c('Year','Investor_Id') ]
+
+
+
+```
+
+regression
+```{r}
+#Run a appropriate regression, considering the form of the outcome variable and incorporating venture capital ???rm ???xed effects, predicting the average distance between a ???rm's syndicate partners and the industry category medoids for the deals that it invests ininagivenyear,as a function of a firm's lagged status,the firm's own average distance from the industry category medoids for the deals that it invests in in a given year, and the interaction between these stwo variables. 
+
+summary(lm(avg_partner_distances ??? avg_own_distances + lag_status + avg_own_distances:lag_status + lag_first + lag_IT + lag_early + Year, data3a))
+```
+
+
+## B
+
+same method with question 2
+```{r}
+# regular 3d plot 
+plotq3 <- scatter3D(values$own_distance_from_the_industry_categories, values$status, values$partners_distance_from_the_industry_Scategories)
+
+```
+
+```{r}
+# interactive 3d plot
+plotq3d <- plot3d(values$own_distance_from_the_industry_categories, values$status, values$partners_distance_from_the_industry_Scategories) 
+```
+
+```{r}
+#colnames(values)<-c("own_distance_from_the_industry_categories","status","partners_distance_from_the_industry_Scategories")
+p3 = plot_ly(
+  values,
+  x = ~own_distance_from_the_industry_categories, 
+  y = ~status,
+  z = ~partners_distance_from_the_industry_Scategories, 
+  type = "contour",
+  autocontour = FALSE, 
+  contours = list( end = max(values$fit, na.rm = TRUE), 
+                   size = abs(max(values$fit, na.rm = TRUE) - min(values$fit, na.rm = TRUE))/20,
+                   start = min(values$fit, na.rm = TRUE), showlines = FALSE ),
+  line = list(smoothing = 0.85),
+  colorscale = "Greys" 
+  ) %>% 
+  colorbar(len = 1, nticks = 10, title = "Estimated successful \n investments") %>% 
+  layout(yaxis = list(title = "Status")) %>% 
+  layout(xaxis = list(title = "own_distance_from_the_industry_categories")) 
+#p3
+
+```
+
+
