@@ -1,0 +1,3 @@
+This project analyze groups and clusters in the networks of venture capital firms. Venture capital firms often co-invest with each other on startup venture as part of syndicate investment teams. The ties formed by co-investing together inﬂuence the strategy and performance of the venture capital ﬁrms and the entrepreneurs they fund, and certain positions in this network are more beneﬁcial than others. 
+
+Addtionally, I allow the network to decay with specific time period, and analysis more about the existentce of its global core-periphery structure. The measurement of performance include number of successful investments and not go out of business.
